@@ -14,6 +14,10 @@ const envSchema = z.object({
   NODE_ENV: z
     .enum(['development', 'test', 'production'])
     .default('development'),
+
+  /** Mocked payment gateway behaviour, see src/services/payments.ts */
+  PAYMENTS_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
+  PAYMENTS_LATENCY_MS: z.coerce.number().int().min(0).default(120),
 });
 
 const parsed = envSchema.safeParse(process.env);
