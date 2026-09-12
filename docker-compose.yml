@@ -45,7 +45,10 @@ services:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
       timeout: 3s
-      retries: 10
+      # Generous while starting, quick to notice afterwards: ten retries meant
+      # nearly a minute of being reported healthy while unable to serve.
+      start_period: 30s
+      retries: 3
 
 volumes:
   pgdata:
