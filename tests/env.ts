@@ -19,6 +19,11 @@ const ADMIN_URL =
 process.env.DATABASE_URL = TEST_URL;
 process.env.NODE_ENV = 'test';
 process.env.LOG_LEVEL = 'silent';
+// The suite runs requests in parallel against one database and asserts on lock
+// contention; a short lock budget keeps that test fast without changing what
+// it proves.
+process.env.DB_POOL_MAX ??= '20';
+process.env.DB_LOCK_TIMEOUT_MS ??= '400';
 
 /**
  * Creates the database if needed and migrates it, so `npm test` works from a

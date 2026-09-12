@@ -12,17 +12,17 @@ pg.types.setTypeParser(pg.types.builtins.INT8, (v) => Number(v));
 
 export const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
-  max: 10,
+  max: config.DB_POOL_MAX,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
   // A request that reserves stock holds row locks; a query that hangs would
   // hold them indefinitely, so we bound it well under the HTTP timeout.
-  statement_timeout: 10_000,
+  statement_timeout: config.DB_STATEMENT_TIMEOUT_MS,
   // Separately from the statement budget, never queue behind a row lock for
   // more than a few seconds. Under heavy contention on one popular SKU,
   // failing fast with a retryable answer beats every worker blocking on the
   // same row until the pool is exhausted.
-  options: '-c lock_timeout=5000',
+  options: `-c lock_timeout=${config.DB_LOCK_TIMEOUT_MS}`,
 });
 
 export const db = drizzle(pool, { schema });

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
+import pg from 'pg';
 import { count, eq, inArray } from 'drizzle-orm';
 import { inventory, orderItems, orders } from '../src/db/schema.ts';
 import { MockPaymentGateway } from '../src/services/payments.ts';
@@ -10,8 +11,10 @@ import {
   db,
   DECLINED_CARD,
   orderPayload,
+  productId,
   resetDatabase,
   stockOf,
+  warehouseId,
 } from './helpers.ts';
 
 let app: FastifyInstance;
@@ -137,6 +140,40 @@ describe('concurrent checkout', () => {
 
     assert.ok(responses.every((r) => r.statusCode === 201));
     assert.equal(await orderCount(), 10);
+  });
+
+  /**
+   * Waiting on a row lock is bounded, so a checkout cannot pin a connection
+   * behind whoever is holding the row. This holds the lock from a separate
+   * connection — the way another instance of the service would — and asserts
+   * the caller is told to retry rather than left hanging or handed a 500.
+   */
+  it('gives up on a contended row instead of waiting forever', async () => {
+    const holder = new pg.Client({ connectionString: process.env.DATABASE_URL });
+    await holder.connect();
+
+    try {
+      await holder.query('begin');
+      await holder.query(
+        `select * from inventory
+         where warehouse_id = $1 and product_id = $2
+         for update`,
+        [warehouseId('Newark NJ'), productId('BRK-20A')],
+      );
+
+      const response = await post(
+        orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
+        'lock-contention-key',
+      );
+
+      assert.equal(response.statusCode, 503);
+      assert.equal(response.json().error.code, 'stock_contended');
+      // Transient by definition, so the client is told when to come back.
+      assert.equal(response.headers['retry-after'], '1');
+    } finally {
+      await holder.query('rollback');
+      await holder.end();
+    }
   });
 
   /**

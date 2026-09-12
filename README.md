@@ -53,7 +53,7 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test           # 76 tests
+npm test           # 77 tests
 npm run lint       # type-aware rules the compiler cannot express
 npm run typecheck
 ```
@@ -464,13 +464,13 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-Seventy-six tests across six files, each covering one thing:
+Seventy-seven tests across six files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
 | `warehouse-selection` | The rule itself: nearest, nearest *that can fill it*, one warehouse rather than several combined, and not enough stock |
 | `checkout` | The endpoint end to end — placing, replaying, both payment outcomes, reading an order back |
-| `concurrency` | What cannot be established by reading: simultaneous orders, deadlock ordering, stock conservation |
+| `concurrency` | What cannot be established by reading: simultaneous orders, deadlock ordering, lock contention, stock conservation |
 | `validation` | The input boundary: every malformed request a client will send by accident |
 | `edge-cases` | What the gateway is actually handed, distance ties, stock boundaries, replays in awkward states |
 | `money` | An order total past the 32-bit ceiling |
@@ -492,7 +492,11 @@ afterwards every unit is accounted for —
 
 Any lost update, double decrement, or compensation that released the wrong
 quantity breaks that equality. The suite was run five times in a row to
-confirm nothing in it is timing-dependent.
+confirm nothing in it is timing-dependent, and it runs against the service's
+own connection pool rather than one built for tests — a pool with different
+timeouts would be exercising something the service never runs. Pool size and
+the statement and lock budgets are configuration, so the suite can shorten the
+lock budget without changing what the contention test proves.
 
 ---
 

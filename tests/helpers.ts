@@ -1,8 +1,12 @@
-import { drizzle } from 'drizzle-orm/node-postgres';
 import { and, eq } from 'drizzle-orm';
-import pg from 'pg';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
+/**
+ * The service's own pool and client, not a second one built for tests. A test
+ * pool with different timeouts or a different size would be exercising
+ * something the service never runs.
+ */
+import { db, pool } from '../src/db/client.ts';
 import * as schema from '../src/db/schema.ts';
 import { applySeed, productIdBySku, warehouseIdByName } from '../src/db/seed-data.ts';
 import { MockGeocodingProvider } from '../src/services/geocoding.ts';
@@ -11,12 +15,7 @@ import {
   type PaymentGateway,
 } from '../src/services/payments.ts';
 
-export const pool = new pg.Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-});
-
-export const db = drizzle(pool, { schema });
+export { db, pool };
 
 /** Restores the fixture data. Called before every test for isolation. */
 export const resetDatabase = () => db.transaction(applySeed);
