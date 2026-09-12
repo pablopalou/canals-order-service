@@ -19,6 +19,11 @@ const envSchema = z.object({
   DB_POOL_MAX: z.coerce.number().int().positive().default(10),
   DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   DB_LOCK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  DB_IDLE_IN_TRANSACTION_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(30_000),
 
   /**
    * How long to wait for the payment gateway before giving up. A charge that

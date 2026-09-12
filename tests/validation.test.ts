@@ -162,6 +162,30 @@ describe('input validation', () => {
     assert.equal(response.json().error.code, 'payload_too_large');
   });
 
+  /**
+   * Postgres text columns cannot store a NUL byte, and a JSON body can carry
+   * one. Before this was validated the insert failed and the caller got a 500
+   * for what is plainly a bad request.
+   */
+  it('rejects control characters a text column cannot store', async () => {
+    const response = await post({
+      ...valid(),
+      shippingAddress: { ...PHILADELPHIA, line1: '1 Market\u0000St' },
+    });
+
+    assert.equal(response.statusCode, 400);
+    assert.equal(response.json().error.code, 'validation_failed');
+  });
+
+  it('accepts accents and emoji, which are ordinary text', async () => {
+    const response = await post({
+      ...valid(),
+      shippingAddress: { ...PHILADELPHIA, line1: 'Åvenida Ñuñoa 123 🏗️' },
+    });
+
+    assert.equal(response.statusCode, 201);
+  });
+
   it('keeps text fields literal rather than interpreting them', async () => {
     const hostile = "Robert'); DROP TABLE orders;--";
     const response = await post({

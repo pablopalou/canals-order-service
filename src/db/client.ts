@@ -22,7 +22,13 @@ export const pool = new pg.Pool({
   // more than a few seconds. Under heavy contention on one popular SKU,
   // failing fast with a retryable answer beats every worker blocking on the
   // same row until the pool is exhausted.
-  options: `-c lock_timeout=${config.DB_LOCK_TIMEOUT_MS}`,
+  // A transaction left open holds its locks until something closes it. If a
+  // bug or a hung await ever gets us there, Postgres ends the session rather
+  // than letting one stuck request block a SKU indefinitely.
+  options: [
+    `-c lock_timeout=${config.DB_LOCK_TIMEOUT_MS}`,
+    `-c idle_in_transaction_session_timeout=${config.DB_IDLE_IN_TRANSACTION_TIMEOUT_MS}`,
+  ].join(' '),
 });
 
 /**
@@ -37,15 +43,32 @@ export const pool = new pg.Pool({
  * depend on the web layer, and this has to be attached the moment the pool
  * exists, before any request can be served.
  */
-pool.on('error', (error) => {
+const reportConnectionFailure = (error: Error, scope: string): void => {
   process.stderr.write(
     `${JSON.stringify({
       level: 50,
       time: Date.now(),
-      msg: 'idle database connection failed; the pool will reconnect',
+      msg: `${scope} database connection failed; the pool will reconnect`,
       err: { type: error.name, message: error.message },
     })}\n`,
   );
+};
+
+pool.on('error', (error) => {
+  reportConnectionFailure(error, 'idle');
+});
+
+/**
+ * The pool only speaks for its *idle* clients. A client checked out for a
+ * transaction emits its failure on itself, so losing the database mid
+ * transaction — a hard kill, a network partition — still reached the process
+ * as an uncaught exception. The in-flight query rejects either way and the
+ * request gets its 503; this listener is what stops the process dying with it.
+ */
+pool.on('connect', (client) => {
+  client.on('error', (error) => {
+    reportConnectionFailure(error, 'in-use');
+  });
 });
 
 export const db = drizzle(pool, { schema });

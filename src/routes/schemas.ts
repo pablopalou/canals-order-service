@@ -28,7 +28,24 @@ const cardNumber = z
   })
   .refine(passesLuhn, { message: 'Card number failed the Luhn check' });
 
-const nonEmpty = (max = 200) => z.string().trim().min(1).max(max);
+/**
+ * Postgres text columns cannot hold a NUL byte, and a JSON body is perfectly
+ * capable of carrying one. Left to the database, it surfaces as a failed
+ * insert and a 500 for what is really a bad request. Other C0 control
+ * characters have no business in an address either.
+ */
+// eslint-disable-next-line no-control-regex -- matching control characters is the point
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+
+const nonEmpty = (max = 200) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(max)
+    .refine((value) => !CONTROL_CHARACTERS.test(value), {
+      message: 'Must not contain control characters',
+    });
 
 export const addressSchema = z.object({
   line1: nonEmpty(),

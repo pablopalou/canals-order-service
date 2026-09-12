@@ -33,6 +33,17 @@ export async function buildApp(
     // A valid order is a few kilobytes. Fastify defaults to a megabyte;
     // stating the limit keeps a hostile body from being parsed at all.
     bodyLimit: 64 * 1024,
+    /**
+     * Node does not time out an incomplete request by default, so a client
+     * that sends headers and then stops holds a socket open forever. Enough
+     * of those and the service runs out of file descriptors while looking
+     * perfectly healthy. Thirty seconds is far longer than any honest client
+     * needs to deliver 64 KB, and it does not bound handler time — a checkout
+     * waiting on a slow gateway is unaffected.
+     */
+    requestTimeout: 30_000,
+    /** Same idea for a connection that opens and never says anything. */
+    connectionTimeout: 30_000,
     logger: {
       level: config.LOG_LEVEL,
       // Card numbers must never reach a log sink, an error tracker, or a
