@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
-import { eq } from 'drizzle-orm';
 import { inventory, warehouses } from '../src/db/schema.ts';
 import type {
   ChargeRequest,
@@ -11,7 +10,6 @@ import type {
 import {
   buildTestApp,
   closeDatabase,
-  CUSTOMER_ID,
   db,
   GOOD_CARD,
   orderPayload,
@@ -20,7 +18,6 @@ import {
   resetDatabase,
   stockOf,
   TIMEOUT_CARD,
-  warehouseId,
 } from './helpers.ts';
 
 let app: FastifyInstance;

@@ -87,7 +87,7 @@ export function orderPayload(overrides: {
 export async function buildTestApp(
   payments: PaymentGateway = new MockPaymentGateway(),
 ): Promise<FastifyInstance> {
-  return buildApp({
+  return await buildApp({
     db,
     geocoding: new MockGeocodingProvider(),
     payments,

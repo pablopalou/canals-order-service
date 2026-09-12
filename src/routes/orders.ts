@@ -40,7 +40,7 @@ export async function registerOrderRoutes(
     const body = createOrderSchema.parse(request.body);
     const order = await createOrder(deps, body, key.data);
 
-    return reply.code(201).header('location', `/orders/${order.id}`).send(order);
+    return await reply.code(201).header('location', `/orders/${order.id}`).send(order);
   });
 
   /**
@@ -48,7 +48,11 @@ export async function registerOrderRoutes(
    * verified, and an order left `pending_payment` by an indeterminate charge
    * has to be inspectable by support and by the reconciliation worker.
    */
-  app.get<{ Params: { id: string } }>('/orders/:id', async (request) => {
+  app.get<{ Params: { id: string } }>('/orders/:id', async (request, reply) => {
+    // An order carries a shipping address and the last digits of a card.
+    // Nothing between here and the caller should be keeping a copy.
+    reply.header('cache-control', 'no-store');
+
     // Without this the database rejects the malformed uuid and the caller
     // gets a 500 for what is plainly a bad request.
     const id = orderIdSchema.safeParse(request.params.id);

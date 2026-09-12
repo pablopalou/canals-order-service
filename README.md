@@ -33,6 +33,11 @@ curl localhost:3000/health
 <details>
 <summary>Running the service outside Docker</summary>
 
+Needs Node 22.18 or newer — the service runs TypeScript directly rather than
+building first, and that is the version where Node does it without a flag. The
+`engines` field enforces it at install time so a wrong version fails with a
+clear message rather than a cryptic runtime error.
+
 ```bash
 docker compose up -d postgres   # database only
 cp .env.example .env
@@ -48,8 +53,13 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test
+npm test           # 76 tests
+npm run lint       # type-aware rules the compiler cannot express
+npm run typecheck
 ```
+
+All four run in CI on every push, along with a production dependency audit and
+a build of the runtime image (`.github/workflows/ci.yml`).
 
 The suite creates and migrates its own database, so it never touches your
 development data. It runs on Node's built-in test runner: no test framework,
@@ -91,19 +101,25 @@ read from the catalogue, never accepted from the client.
 | 201 | — | Order placed and paid |
 | 400 | `validation_failed` | Malformed body: bad UUID, non-positive quantity, duplicate line, card failing the Luhn check |
 | 400 | `idempotency_key_required` / `idempotency_key_invalid` | Header missing, or present but too short |
+| 400 | `invalid_order_id` | The id on `GET /orders/:id` is not a UUID |
 | 402 | `payment_declined` | The issuer said no. Stock released, order marked `payment_failed` |
 | 404 | `customer_not_found` / `product_not_found` | Unknown id |
 | 409 | `no_eligible_warehouse` | No single warehouse holds every line in the required quantity |
 | 409 | `request_in_progress` | Same idempotency key, first attempt still running |
 | 422 | `address_not_geocodable` | The address could not be resolved |
 | 422 | `idempotency_key_reused` | Key already used with a different body |
-| 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable |
+| 405 | `method_not_allowed` | Path exists under another method; the `Allow` header lists which |
+| 413 | `payload_too_large` | Body over 64 KB |
+| 415 | `unsupported_media_type` | Body is not JSON |
+| 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable, with `Retry-After` |
 | 504 | `payment_indeterminate` | Charge timed out. Stock **held**, order left `pending_payment` for reconciliation |
 
 ### `GET /orders/:id`
 
 Not in the brief, but a write-only checkout cannot be verified, and an order
 left `pending_payment` by an indeterminate charge has to be inspectable.
+Responses carry `Cache-Control: no-store`, since an order holds a shipping
+address and part of a card number.
 
 ### Test cards
 
@@ -328,12 +344,46 @@ auth were still treated as if this were live:
   payload is rejected before it is parsed.
 - **Queries are bounded**: ten seconds per statement, five for a row lock. A
   request cannot pin a connection or a lock indefinitely.
+- **Bodies reaching the prototype chain are refused.** Fastify parses with
+  secure-json-parse, and a test asserts it rather than leaving it to luck.
+- **Responses carry `X-Content-Type-Options: nosniff`**, and orders carry
+  `Cache-Control: no-store` so nothing between here and the caller keeps a copy.
+- **No production dependency carries a known advisory** (`npm audit
+  --omit=dev` is clean, and CI fails if that changes). The development tree
+  reports four moderate advisories, all of them inside `drizzle-kit`, which
+  only generates migration files and is in neither the runtime image nor the
+  test path.
 
 Known gaps, all of them consequences of having no auth in scope: anyone
 holding an order's UUID can read it, error codes distinguish an unknown
 customer from an unknown product, and there is no rate limiting. In a real
 deployment the endpoint sits behind authentication, orders are scoped to the
 authenticated customer, and the write path is rate limited per customer.
+
+### Tooling
+
+Two choices here were not the obvious ones.
+
+**TypeScript 5.9 rather than 7.** TypeScript 7 is the current release and it is
+faster, but it replaced the compiler's JavaScript API, and type-aware linting
+has not caught up: `typescript-eslint` still declares a peer range of
+`<6.1.0`. Installing it anyway needs `--force`, which means the reviewer's
+`npm install` fails. Between the newest compiler and a lint rule that catches
+forgotten `await`s in a service that holds database locks, the lint rule is
+worth more — a floating promise here is silent corruption, not a style
+complaint. It found a real one, described below.
+
+**ESLint rather than Biome.** Biome is faster and would replace the formatter
+too, but it ships as a platform-specific native binary, which is the exact
+dependency shape that already broke `npm install` here once. ESLint is plain
+JavaScript. The config does not repeat what the compiler already enforces; it
+adds the type-aware rules a type checker cannot express.
+
+The lint run is not decorative. It found that the shutdown handler passed an
+`async` function to `process.once`, so a rejection while draining would have
+become an unhandled rejection and killed the process mid-drain — precisely
+what draining exists to prevent. That path now handles its own failure and
+gives up on a timeout rather than waiting for SIGKILL.
 
 ### Idempotency
 
@@ -357,6 +407,21 @@ only thing standing between a double click and a second charge.
 Because this lives in Postgres rather than in memory, it survives a restart:
 replaying a key after `docker compose restart app` still returns the original
 order.
+
+### Two conventions I considered and did not adopt
+
+**RFC 9457 problem details** (`application/problem+json`) is the standardised
+error format, and it would be the right call for a public API with unknown
+consumers. This one has a single known consumer, and the envelope here carries
+what that consumer needs — a stable machine-readable `code`, a human message,
+and a `requestId` to correlate against the logs — in a shape that is easier to
+branch on than a `type` URI. Worth revisiting the moment a second consumer
+appears.
+
+**A `/v1` prefix.** Versioning earns its place when consumers you cannot deploy
+alongside depend on you. This endpoint is called by the same team's UI, where a
+breaking change is a coordinated deploy rather than a negotiation. Adding the
+prefix now would be ceremony; adding it later is a routing change.
 
 ### Data
 
@@ -399,7 +464,7 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-Seventy tests across five files, each covering one thing:
+Seventy-six tests across six files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
@@ -409,6 +474,7 @@ Seventy tests across five files, each covering one thing:
 | `validation` | The input boundary: every malformed request a client will send by accident |
 | `edge-cases` | What the gateway is actually handed, distance ties, stock boundaries, replays in awkward states |
 | `money` | An order total past the 32-bit ceiling |
+| `http-semantics` | Location, 405 with Allow, cache and sniffing headers, prototype-chain payloads |
 
 The brief says tests are optional and that they trade poorly against reviewer
 time, which is why none of them assert framework behaviour for its own sake —

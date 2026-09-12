@@ -126,7 +126,7 @@ export async function createOrder(
 
   const reserved = await reserveOrder(deps, input, destination, idempotencyKey);
 
-  return settlePayment(
+  return await settlePayment(
     deps,
     idempotencyKey,
     reserved,
@@ -152,7 +152,7 @@ async function reserveOrder(
   destination: Coordinates,
   idempotencyKey: string,
 ): Promise<ReservedOrder> {
-  return withLockContentionMapped(() =>
+  return await withLockContentionMapped(() =>
     deps.db.transaction(async (tx) => {
       await claimIdempotencyKey(tx, idempotencyKey, input);
       await assertCustomerExists(tx, input.customerId);

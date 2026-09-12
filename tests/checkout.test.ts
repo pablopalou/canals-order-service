@@ -183,7 +183,10 @@ describe('POST /orders', () => {
       assert.equal(response.json().error.code, 'payment_declined');
       // Nobody was charged, so the units must go back on the shelf.
       assert.equal(await stockOf('Newark NJ', 'WIRE-12-500'), before);
-      assert.equal((await latestOrder())?.status, 'payment_failed');
+
+      const order = await latestOrder();
+      assert.ok(order, 'the failed order should still exist');
+      assert.equal(order.status, 'payment_failed');
     });
 
     /**
@@ -206,8 +209,9 @@ describe('POST /orders', () => {
       assert.equal(await stockOf('Newark NJ', 'WIRE-12-500'), before - 3);
 
       const order = await latestOrder();
-      assert.equal(order?.status, 'pending_payment');
-      assert.ok(order?.paymentFailureReason);
+      assert.ok(order, 'the pending order should still exist');
+      assert.equal(order.status, 'pending_payment');
+      assert.ok(order.paymentFailureReason);
     });
   });
 

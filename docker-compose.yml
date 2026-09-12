@@ -19,6 +19,9 @@ services:
 
   app:
     build: .
+    # Node runs as PID 1 here, where it is not expected to reap children or
+    # forward signals. Docker's init does both.
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
