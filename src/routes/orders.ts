@@ -10,16 +10,25 @@ export async function registerOrderRoutes(
   deps: OrderDependencies,
 ): Promise<void> {
   app.post('/orders', async (request, reply) => {
-    const key = idempotencyKeySchema.safeParse(
-      request.headers['idempotency-key'],
-    );
-    if (!key.success) {
+    const rawKey = request.headers['idempotency-key'];
+    if (rawKey === undefined) {
       throw new AppError(
         400,
         'idempotency_key_required',
         'An Idempotency-Key header is required. This endpoint is called on a ' +
           'user action, so retries and double submits are expected, and the ' +
           'key is what stops them from placing a second order.',
+      );
+    }
+
+    const key = idempotencyKeySchema.safeParse(rawKey);
+    if (!key.success) {
+      // Reporting a malformed key as a missing one sends the caller looking
+      // for a header they already sent.
+      throw new AppError(
+        400,
+        'idempotency_key_invalid',
+        key.error.issues[0]?.message ?? 'Invalid Idempotency-Key header',
       );
     }
 

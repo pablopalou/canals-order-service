@@ -19,6 +19,20 @@ import { findEligibleWarehouses } from './warehouse-selection.ts';
 
 const PG_UNIQUE_VIOLATION = '23505';
 
+/**
+ * Drizzle wraps driver errors, so the Postgres error code is not on the error
+ * it throws but somewhere down its cause chain. Matching only the top-level
+ * error silently turns an expected duplicate-key conflict into a 500.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  for (let current = error; current instanceof Error; current = current.cause) {
+    if ((current as { code?: unknown }).code === PG_UNIQUE_VIOLATION) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export type CreateOrderInput = {
   customerId: string;
   shippingAddress: Address;
@@ -194,10 +208,7 @@ async function claimIdempotencyKey(
       .values({ key, requestFingerprint: fingerprint(input) });
   } catch (error) {
     // Two identical requests raced past findReplay; the loser stops here.
-    if (
-      error instanceof Error &&
-      (error as { code?: string }).code === PG_UNIQUE_VIOLATION
-    ) {
+    if (isUniqueViolation(error)) {
       throw new AppError(
         409,
         'request_in_progress',
