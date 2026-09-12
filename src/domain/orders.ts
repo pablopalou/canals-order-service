@@ -149,7 +149,12 @@ export async function createOrder(
     );
   });
 
-  return settlePayment(deps, idempotencyKey, reserved);
+  return settlePayment(
+    deps,
+    idempotencyKey,
+    reserved,
+    input.payment.cardNumber,
+  );
 }
 
 /**
@@ -407,6 +412,12 @@ async function settlePayment(
   deps: OrderDependencies,
   idempotencyKey: string,
   reserved: ReservedOrder,
+  /**
+   * The only place the full number is used. It lives in memory for the
+   * duration of the request, is handed to the gateway, and is never written
+   * to the database or to a log.
+   */
+  cardNumber: string,
 ): Promise<OrderResponse> {
   const { order } = reserved;
 
@@ -414,7 +425,7 @@ async function settlePayment(
   try {
     const charge = await deps.payments.charge({
       idempotencyKey,
-      cardNumber: `**** **** **** ${order.cardLast4}`,
+      cardNumber,
       amountCents: order.totalCents,
       currency: order.currency,
       description: `Order ${order.id}`,

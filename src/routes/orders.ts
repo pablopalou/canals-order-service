@@ -3,7 +3,10 @@ import { eq } from 'drizzle-orm';
 import { orders } from '../db/schema.ts';
 import { AppError } from '../errors.ts';
 import { createOrder, type OrderDependencies } from '../domain/orders.ts';
+import { z } from 'zod';
 import { createOrderSchema, idempotencyKeySchema } from './schemas.ts';
+
+const orderIdSchema = z.uuid();
 
 export async function registerOrderRoutes(
   app: FastifyInstance,
@@ -44,8 +47,15 @@ export async function registerOrderRoutes(
    * has to be inspectable by support and by the reconciliation worker.
    */
   app.get<{ Params: { id: string } }>('/orders/:id', async (request) => {
+    // Without this the database rejects the malformed uuid and the caller
+    // gets a 500 for what is plainly a bad request.
+    const id = orderIdSchema.safeParse(request.params.id);
+    if (!id.success) {
+      throw new AppError(400, 'invalid_order_id', 'Order id must be a UUID');
+    }
+
     const order = await deps.db.query.orders.findFirst({
-      where: eq(orders.id, request.params.id),
+      where: eq(orders.id, id.data),
     });
 
     if (!order) {

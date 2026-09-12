@@ -35,6 +35,16 @@ export async function buildApp(
 
   await registerOrderRoutes(app, deps);
 
+  app.setNotFoundHandler((request, reply) =>
+    reply.code(404).send({
+      error: {
+        code: 'route_not_found',
+        message: `${request.method} ${request.url} is not a route on this service`,
+      },
+      requestId: request.id,
+    }),
+  );
+
   app.setErrorHandler((error, request, reply) => {
     if (isAppError(error)) {
       request.log.info(
@@ -60,6 +70,25 @@ export async function buildApp(
             path: issue.path.join('.'),
             message: issue.message,
           })),
+        },
+        requestId: request.id,
+      });
+    }
+
+    // Fastify raises its own errors before a handler ever runs: an unparseable
+    // body, an unsupported content type, a payload over the limit. They are
+    // the client's fault and carry a status, so they are reported in the same
+    // shape as everything else rather than as a 500.
+    const status = (error as { statusCode?: number }).statusCode;
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      request.log.info({ err: error, status }, 'malformed request');
+      return reply.code(status).send({
+        error: {
+          // Framework error identifiers are an implementation detail; clients
+          // branch on our own stable codes.
+          code: 'malformed_request',
+          message:
+            error instanceof Error ? error.message : 'Malformed request',
         },
         requestId: request.id,
       });

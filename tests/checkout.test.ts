@@ -191,6 +191,48 @@ describe('POST /orders', () => {
     });
   });
 
+  describe('reading an order back', () => {
+    it('returns the order that was placed', async () => {
+      const created = await post(
+        orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
+      );
+      const id = created.json().id;
+
+      const response = await app.inject({ method: 'GET', url: `/orders/${id}` });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json().id).toBe(id);
+      expect(response.json().status).toBe('paid');
+    });
+
+    it('rejects a malformed id instead of letting the database reject it', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/orders/not-a-uuid',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe('invalid_order_id');
+    });
+
+    it('answers an unknown order with 404', async () => {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/orders/11111111-1111-4111-8111-111111111111',
+      });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.code).toBe('order_not_found');
+    });
+
+    it('answers an unknown route in the same error shape', async () => {
+      const response = await app.inject({ method: 'GET', url: '/nope' });
+
+      expect(response.statusCode).toBe(404);
+      expect(response.json().error.code).toBe('route_not_found');
+    });
+  });
+
   describe('validation', () => {
     it('rejects a card that fails the Luhn check', async () => {
       const response = await post(
@@ -234,6 +276,21 @@ describe('POST /orders', () => {
       });
       expect(unknownProduct.statusCode).toBe(404);
       expect(unknownProduct.json().error.code).toBe('product_not_found');
+    });
+
+    it('answers a malformed body with our error shape, not the framework\'s', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/orders',
+        headers: {
+          'idempotency-key': 'malformed-body-key',
+          'content-type': 'application/json',
+        },
+        payload: '{not json',
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error.code).toBe('malformed_request');
     });
 
     it('rejects a non-US address the geocoder cannot resolve', async () => {
