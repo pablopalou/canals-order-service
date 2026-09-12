@@ -21,7 +21,18 @@ export const db = drizzle(pool, { schema });
 /** Restores the fixture data. Called before every test for isolation. */
 export const resetDatabase = () => db.transaction(applySeed);
 
-export const closeDatabase = () => pool.end();
+let poolClosed = false;
+
+/**
+ * Idempotent: a test file with several suites would otherwise close the shared
+ * pool when its first suite finishes, and every later suite would fail on a
+ * pool that is already gone.
+ */
+export const closeDatabase = async (): Promise<void> => {
+  if (poolClosed) return;
+  poolClosed = true;
+  await pool.end();
+};
 
 export const productId = (sku: string): string => productIdBySku.get(sku)!;
 export const warehouseId = (name: string): string => warehouseIdByName.get(name)!;

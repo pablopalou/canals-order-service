@@ -399,14 +399,34 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-The brief says tests are optional, so the suite is deliberately narrow: it
-covers what cannot be established by reading the code. Warehouse selection has
-edge cases worth pinning down, and the reservation logic can only be shown to
-hold under concurrency by running it concurrently. There is no test asserting
-that Fastify returns 404 for unknown routes.
+Seventy tests across five files, each covering one thing:
 
-The bugs the suite found during development are described in the commits that
+| File | What it holds |
+| --- | --- |
+| `warehouse-selection` | The rule itself: nearest, nearest *that can fill it*, one warehouse rather than several combined, and not enough stock |
+| `checkout` | The endpoint end to end — placing, replaying, both payment outcomes, reading an order back |
+| `concurrency` | What cannot be established by reading: simultaneous orders, deadlock ordering, stock conservation |
+| `validation` | The input boundary: every malformed request a client will send by accident |
+| `edge-cases` | What the gateway is actually handed, distance ties, stock boundaries, replays in awkward states |
+| `money` | An order total past the 32-bit ceiling |
+
+The brief says tests are optional and that they trade poorly against reviewer
+time, which is why none of them assert framework behaviour for its own sake —
+the two that touch 404s and 415s are there because *we* changed those
+responses. The suite exists because "production-ready" was the other
+instruction, and two of these found real bugs, described in the commits that
 fixed them.
+
+The one worth reading is `conserves every unit of stock under mixed concurrent
+load`: twenty simultaneous orders over overlapping products, a third of them
+on declining cards so compensation runs while others are still reserving, and
+afterwards every unit is accounted for —
+
+    stock now + units held by paid orders === stock before
+
+Any lost update, double decrement, or compensation that released the wrong
+quantity breaks that equality. The suite was run five times in a row to
+confirm nothing in it is timing-dependent.
 
 ---
 

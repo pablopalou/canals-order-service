@@ -8,6 +8,12 @@ export type AppDependencies = Omit<OrderDependencies, 'logger'>;
 import { isAppError } from './errors.ts';
 import { registerOrderRoutes } from './routes/orders.ts';
 
+/** Our own names for the refusals Fastify makes before a handler runs. */
+const FRAMEWORK_ERROR_CODES: Record<number, string> = {
+  413: 'payload_too_large',
+  415: 'unsupported_media_type',
+};
+
 export async function buildApp(
   deps: AppDependencies,
 ): Promise<FastifyInstance> {
@@ -92,7 +98,7 @@ export async function buildApp(
         error: {
           // Framework error identifiers are an implementation detail; clients
           // branch on our own stable codes.
-          code: 'malformed_request',
+          code: FRAMEWORK_ERROR_CODES[status] ?? 'malformed_request',
           message:
             error instanceof Error ? error.message : 'Malformed request',
         },

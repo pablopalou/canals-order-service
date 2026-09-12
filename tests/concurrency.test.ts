@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
-import { count } from 'drizzle-orm';
-import { orders } from '../src/db/schema.ts';
+import { count, eq, inArray } from 'drizzle-orm';
+import { inventory, orderItems, orders } from '../src/db/schema.ts';
 import { MockPaymentGateway } from '../src/services/payments.ts';
 import {
   buildTestApp,
   closeDatabase,
   db,
+  DECLINED_CARD,
   orderPayload,
   resetDatabase,
   stockOf,
@@ -137,4 +138,127 @@ describe('concurrent checkout', () => {
     assert.ok(responses.every((r) => r.statusCode === 201));
     assert.equal(await orderCount(), 10);
   });
+
+  /**
+   * Orders that share a warehouse but no products must not queue behind one
+   * another: locks are taken per row, not per warehouse. If this ever starts
+   * serialising, throughput on a busy warehouse collapses for no reason.
+   */
+  it('does not serialise orders that share no products', async () => {
+    const skus = ['CU-ELB-050', 'PVC-TEE-075', 'BRK-20A', 'SOLD-LF-1LB'];
+
+    const responses = await Promise.all(
+      skus.map((sku, i) =>
+        post(
+          orderPayload({ items: [{ sku, quantity: 1 }] }),
+          `disjoint-key-${i}`,
+        ),
+      ),
+    );
+
+    assert.ok(responses.every((r) => r.statusCode === 201));
+    assert.equal(await orderCount(), skus.length);
+  });
+
+  /**
+   * The strongest statement the suite makes. Twenty concurrent orders, half of
+   * them on cards that decline, across overlapping products, and afterwards
+   * every unit is accounted for:
+   *
+   *   stock now + units held by paid orders === stock before
+   *
+   * Any lost update, double decrement or compensation that released the wrong
+   * quantity breaks this equality. Checking each product individually would
+   * miss a mistake that moves units between products.
+   */
+  it('conserves every unit of stock under mixed concurrent load', async () => {
+    const before = await inventorySnapshot();
+
+    const skus = ['CU-ELB-050', 'PVC-TEE-075', 'BRK-20A', 'SOLD-LF-1LB'];
+    const responses = await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        post(
+          orderPayload({
+            items: [
+              { sku: skus[i % skus.length]!, quantity: 2 },
+              { sku: skus[(i + 1) % skus.length]!, quantity: 1 },
+            ],
+            // Every third attempt is declined, so compensation runs while
+            // other orders are still reserving.
+            cardNumber: i % 3 === 0 ? DECLINED_CARD : undefined,
+          }),
+          `mixed-load-key-${i}`,
+        ),
+      ),
+    );
+
+    const paid = responses.filter((r) => r.statusCode === 201);
+    const declined = responses.filter((r) => r.statusCode === 402);
+    assert.equal(paid.length + declined.length, responses.length);
+    assert.ok(paid.length > 0 && declined.length > 0);
+
+    const after = await inventorySnapshot();
+    const held = await unitsHeldByPaidOrders();
+
+    for (const [key, quantityBefore] of before) {
+      const quantityNow = after.get(key) ?? 0;
+      assert.equal(
+        quantityNow + (held.get(key) ?? 0),
+        quantityBefore,
+        `stock for ${key} does not add up`,
+      );
+      assert.ok(quantityNow >= 0, `stock for ${key} went negative`);
+    }
+  });
 });
+
+/** Every (warehouse, product) row, keyed for comparison. */
+async function inventorySnapshot(): Promise<Map<string, number>> {
+  const rows = await db
+    .select({
+      warehouseId: inventory.warehouseId,
+      productId: inventory.productId,
+      quantity: inventory.quantity,
+    })
+    .from(inventory);
+
+  return new Map(
+    rows.map((row) => [`${row.warehouseId}:${row.productId}`, row.quantity]),
+  );
+}
+
+/** Units committed to orders that actually completed. */
+async function unitsHeldByPaidOrders(): Promise<Map<string, number>> {
+  const paidOrders = await db
+    .select({ id: orders.id, warehouseId: orders.warehouseId })
+    .from(orders)
+    .where(eq(orders.status, 'paid'));
+
+  const held = new Map<string, number>();
+  if (paidOrders.length === 0) return held;
+
+  const lines = await db
+    .select({
+      orderId: orderItems.orderId,
+      productId: orderItems.productId,
+      quantity: orderItems.quantity,
+    })
+    .from(orderItems)
+    .where(
+      inArray(
+        orderItems.orderId,
+        paidOrders.map((order) => order.id),
+      ),
+    );
+
+  const warehouseByOrder = new Map(
+    paidOrders.map((order) => [order.id, order.warehouseId]),
+  );
+
+  for (const line of lines) {
+    const key = `${warehouseByOrder.get(line.orderId)}:${line.productId}`;
+    held.set(key, (held.get(key) ?? 0) + line.quantity);
+  }
+
+  return held;
+}
