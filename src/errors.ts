@@ -4,14 +4,21 @@
  * handful of cases here justify, and callers only ever branch on `code`.
  */
 export class AppError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly details?: unknown;
+
   constructor(
-    readonly status: number,
-    readonly code: string,
+    status: number,
+    code: string,
     message: string,
-    readonly details?: unknown,
+    details?: unknown,
   ) {
     super(message);
     this.name = 'AppError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
   }
 }
 

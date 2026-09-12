@@ -52,7 +52,8 @@ npm test
 ```
 
 The suite creates and migrates its own database, so it never touches your
-development data.
+development data. It runs on Node's built-in test runner: no test framework,
+no bundler, no platform-specific binaries to fail to install.
 
 ---
 
@@ -357,14 +358,22 @@ continental US.
 
 ### Tests
 
+The suite runs on `node --test`. An earlier version used a test framework,
+until cloning the repository into a temporary directory showed `npm test`
+failing on a fresh install: the framework's bundler resolves a native binary
+through an optional peer dependency, which npm does not install from a
+lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
+on my machine and nowhere else. Node runs TypeScript and tests on its own, so
+the dependency was removed rather than worked around, and `tsx` went with it.
+
 The brief says tests are optional, so the suite is deliberately narrow: it
 covers what cannot be established by reading the code. Warehouse selection has
 edge cases worth pinning down, and the reservation logic can only be shown to
 hold under concurrency by running it concurrently. There is no test asserting
 that Fastify returns 404 for unknown routes.
 
-Both bugs the suite found during development are described in the commit that
-introduced it.
+The bugs the suite found during development are described in the commits that
+fixed them.
 
 ---
 

@@ -1,6 +1,7 @@
+import assert from 'node:assert/strict';
+import { after, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { count } from 'drizzle-orm';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { orders } from '../src/db/schema.ts';
 import { MockPaymentGateway } from '../src/services/payments.ts';
 import {
@@ -28,8 +29,8 @@ const orderCount = async () => {
 };
 
 /**
- * These are the tests worth having. Everything else in the service can be read
- * and reasoned about; whether the reservation logic actually holds under
+ * These are the tests worth having. The rest of the service can be read and
+ * reasoned about; whether the reservation logic actually holds under
  * concurrent load can only be established by running it concurrently.
  */
 describe('concurrent checkout', () => {
@@ -39,7 +40,7 @@ describe('concurrent checkout', () => {
     // which is exactly where a race would hide.
     app = await buildTestApp(new MockPaymentGateway({ latencyMs: 40 }));
   });
-  afterAll(closeDatabase);
+  after(closeDatabase);
 
   it('sells the last unit exactly once', async () => {
     // FLUX-8OZ: one unit, in one warehouse.
@@ -56,19 +57,19 @@ describe('concurrent checkout', () => {
     const created = responses.filter((r) => r.statusCode === 201);
     const rejected = responses.filter((r) => r.statusCode === 409);
 
-    expect(created).toHaveLength(1);
-    expect(rejected).toHaveLength(attempts - 1);
-    expect(
+    assert.equal(created.length, 1);
+    assert.equal(rejected.length, attempts - 1);
+    assert.ok(
       rejected.every((r) => r.json().error.code === 'no_eligible_warehouse'),
-    ).toBe(true);
+    );
 
     // The invariant that matters: stock is drained, never negative.
-    expect(await stockOf('Newark NJ', 'FLUX-8OZ')).toBe(0);
-    expect(await orderCount()).toBe(1);
+    assert.equal(await stockOf('Newark NJ', 'FLUX-8OZ'), 0);
+    assert.equal(await orderCount(), 1);
   });
 
   /**
-   * The eligibility query runs before any row is locked, so the warehouse it
+   * Eligibility is computed before any row is locked, so the warehouse it
    * picks can be emptied in between. The reservation re-checks under the lock
    * and falls through to the next candidate rather than overselling.
    */
@@ -79,13 +80,14 @@ describe('concurrent checkout', () => {
       post(orderPayload({ items: [{ sku: 'TORCH-KIT', quantity: 1 }] }), 'fallthrough-b'),
     ]);
 
-    expect([first!.statusCode, second!.statusCode]).toEqual([201, 201]);
-    expect(
+    assert.deepEqual([first!.statusCode, second!.statusCode], [201, 201]);
+    assert.deepEqual(
       [first!.json().warehouse.name, second!.json().warehouse.name].sort(),
-    ).toEqual(['Dallas TX', 'Los Angeles CA']);
+      ['Dallas TX', 'Los Angeles CA'],
+    );
 
-    expect(await stockOf('Dallas TX', 'TORCH-KIT')).toBe(0);
-    expect(await stockOf('Los Angeles CA', 'TORCH-KIT')).toBe(2);
+    assert.equal(await stockOf('Dallas TX', 'TORCH-KIT'), 0);
+    assert.equal(await stockOf('Los Angeles CA', 'TORCH-KIT'), 2);
   });
 
   /** A double click: the same request, twice, at the same instant. */
@@ -98,17 +100,19 @@ describe('concurrent checkout', () => {
       post(payload, 'double-click'),
     ]);
 
-    const codes = responses.map((r) => r.statusCode).sort();
-    expect(codes).toEqual([201, 409]);
-    expect(await orderCount()).toBe(1);
-    expect(await stockOf('Newark NJ', 'BRK-20A')).toBe(before - 2);
+    assert.deepEqual(
+      responses.map((r) => r.statusCode).sort(),
+      [201, 409],
+    );
+    assert.equal(await orderCount(), 1);
+    assert.equal(await stockOf('Newark NJ', 'BRK-20A'), before - 2);
   });
 
   /**
    * Two orders sharing products, listed in opposite order. Locks are acquired
-   * sorted by product id regardless of payload order, so these cannot deadlock.
-   * Without that sort this test fails intermittently, which is the worst way
-   * for a deadlock to be discovered.
+   * sorted by product id regardless of payload order, so these cannot
+   * deadlock. Without that sort this test fails intermittently, which is the
+   * worst way for a deadlock to be discovered.
    */
   it('does not deadlock when orders share products in opposite order', async () => {
     const forwards = orderPayload({
@@ -130,7 +134,7 @@ describe('concurrent checkout', () => {
       ),
     );
 
-    expect(responses.every((r) => r.statusCode === 201)).toBe(true);
-    expect(await orderCount()).toBe(10);
+    assert.ok(responses.every((r) => r.statusCode === 201));
+    assert.equal(await orderCount(), 10);
   });
 });

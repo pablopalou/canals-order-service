@@ -10,6 +10,9 @@
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
     "verbatimModuleSyntax": true,
+    // Node runs these files directly by erasing types. Syntax that needs a
+    // transpiler (parameter properties, enums, namespaces) must not compile.
+    "erasableSyntaxOnly": true,
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true,
     "skipLibCheck": true,

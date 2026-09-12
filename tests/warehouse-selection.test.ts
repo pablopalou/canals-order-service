@@ -1,4 +1,5 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import assert from 'node:assert/strict';
+import { after, beforeEach, describe, it } from 'node:test';
 import { findEligibleWarehouses } from '../src/domain/warehouse-selection.ts';
 import { closeDatabase, db, productId, resetDatabase } from './helpers.ts';
 
@@ -12,7 +13,7 @@ const line = (sku: string, quantity: number) => ({
 
 describe('warehouse selection', () => {
   beforeEach(resetDatabase);
-  afterAll(closeDatabase);
+  after(closeDatabase);
 
   it('prefers the closest warehouse when several can fill the order', async () => {
     const eligible = await findEligibleWarehouses(
@@ -21,10 +22,10 @@ describe('warehouse selection', () => {
       PHILADELPHIA,
     );
 
-    expect(eligible[0]?.name).toBe('Newark NJ');
-    expect(eligible.map((w) => w.distanceKm)).toEqual(
-      [...eligible.map((w) => w.distanceKm)].sort((a, b) => a - b),
-    );
+    assert.equal(eligible[0]?.name, 'Newark NJ');
+
+    const distances = eligible.map((w) => w.distanceKm);
+    assert.deepEqual(distances, [...distances].sort((a, b) => a - b));
   });
 
   /**
@@ -39,7 +40,10 @@ describe('warehouse selection', () => {
       PHILADELPHIA,
     );
 
-    expect(eligible.map((w) => w.name)).toEqual(['Dallas TX', 'Los Angeles CA']);
+    assert.deepEqual(
+      eligible.map((w) => w.name),
+      ['Dallas TX', 'Los Angeles CA'],
+    );
   });
 
   it('requires one warehouse to cover the whole order, not several combined', async () => {
@@ -51,23 +55,23 @@ describe('warehouse selection', () => {
       PHILADELPHIA,
     );
 
-    expect(eligible).toEqual([]);
+    assert.deepEqual(eligible, []);
   });
 
   it('excludes warehouses that stock the product but not enough of it', async () => {
+    // Newark holds exactly twelve.
     const enough = await findEligibleWarehouses(
       db,
       [line('WIRE-12-500', 12)],
       PHILADELPHIA,
     );
-    expect(enough.map((w) => w.name)).toContain('Newark NJ');
+    assert.ok(enough.some((w) => w.name === 'Newark NJ'));
 
-    // Newark holds exactly 12.
     const tooMany = await findEligibleWarehouses(
       db,
       [line('WIRE-12-500', 13)],
       PHILADELPHIA,
     );
-    expect(tooMany.map((w) => w.name)).not.toContain('Newark NJ');
+    assert.ok(!tooMany.some((w) => w.name === 'Newark NJ'));
   });
 });

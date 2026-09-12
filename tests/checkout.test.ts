@@ -1,6 +1,7 @@
+import assert from 'node:assert/strict';
+import { after, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { orders } from '../src/db/schema.ts';
 import {
   buildTestApp,
@@ -28,12 +29,20 @@ const post = (payload: unknown, key = nextKey()) =>
     payload: payload as object,
   });
 
+const latestOrder = async () => {
+  const [order] = await db
+    .select()
+    .from(orders)
+    .where(eq(orders.customerId, CUSTOMER_ID));
+  return order;
+};
+
 describe('POST /orders', () => {
   beforeEach(async () => {
     await resetDatabase();
     app = await buildTestApp();
   });
-  afterAll(closeDatabase);
+  after(closeDatabase);
 
   it('places an order, charges the card and decrements stock', async () => {
     const before = await stockOf('Dallas TX', 'CU-ELB-050');
@@ -47,30 +56,32 @@ describe('POST /orders', () => {
       }),
     );
 
-    expect(response.statusCode).toBe(201);
+    assert.equal(response.statusCode, 201);
     const body = response.json();
-    expect(body.status).toBe('paid');
-    expect(body.warehouse.name).toBe('Dallas TX');
-    expect(body.totalCents).toBe(2 * 189 + 6499);
-    expect(body.paymentId).toMatch(/^pay_/);
-    expect(body.cardLast4).toBe('4242');
-    expect(response.headers.location).toBe(`/orders/${body.id}`);
+    assert.equal(body.status, 'paid');
+    assert.equal(body.warehouse.name, 'Dallas TX');
+    assert.equal(body.totalCents, 2 * 189 + 6499);
+    assert.match(body.paymentId, /^pay_/);
+    assert.equal(body.cardLast4, '4242');
+    assert.equal(response.headers.location, `/orders/${body.id}`);
 
-    expect(await stockOf('Dallas TX', 'CU-ELB-050')).toBe(before - 2);
-    expect(await stockOf('Dallas TX', 'TORCH-KIT')).toBe(0);
+    assert.equal(await stockOf('Dallas TX', 'CU-ELB-050'), before - 2);
+    assert.equal(await stockOf('Dallas TX', 'TORCH-KIT'), 0);
   });
 
   it('never trusts the client for prices', async () => {
     const response = await post({
       ...orderPayload({ items: [{ sku: 'TORCH-KIT', quantity: 1 }] }),
-      // A hostile client trying to set its own price. The field is not part of
+      // A hostile client trying to set its own price. Neither field is part of
       // the contract, and the total must still come from the catalogue.
       totalCents: 1,
-      items: [{ productId: productId('TORCH-KIT'), quantity: 1, unitPriceCents: 1 }],
+      items: [
+        { productId: productId('TORCH-KIT'), quantity: 1, unitPriceCents: 1 },
+      ],
     });
 
-    expect(response.statusCode).toBe(201);
-    expect(response.json().totalCents).toBe(6499);
+    assert.equal(response.statusCode, 201);
+    assert.equal(response.json().totalCents, 6499);
   });
 
   it('rejects an order no single warehouse can fill', async () => {
@@ -83,8 +94,8 @@ describe('POST /orders', () => {
       }),
     );
 
-    expect(response.statusCode).toBe(409);
-    expect(response.json().error.code).toBe('no_eligible_warehouse');
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.json().error.code, 'no_eligible_warehouse');
   });
 
   describe('idempotency', () => {
@@ -96,11 +107,11 @@ describe('POST /orders', () => {
       const stockAfterFirst = await stockOf('Newark NJ', 'BRK-20A');
       const second = await post(payload, key);
 
-      expect(first.statusCode).toBe(201);
-      expect(second.statusCode).toBe(201);
-      expect(second.json()).toEqual(first.json());
+      assert.equal(first.statusCode, 201);
+      assert.equal(second.statusCode, 201);
+      assert.deepEqual(second.json(), first.json());
       // The replay must not place a second order or move stock again.
-      expect(await stockOf('Newark NJ', 'BRK-20A')).toBe(stockAfterFirst);
+      assert.equal(await stockOf('Newark NJ', 'BRK-20A'), stockAfterFirst);
     });
 
     it('rejects a key reused with a different body', async () => {
@@ -112,8 +123,8 @@ describe('POST /orders', () => {
         key,
       );
 
-      expect(response.statusCode).toBe(422);
-      expect(response.json().error.code).toBe('idempotency_key_reused');
+      assert.equal(response.statusCode, 422);
+      assert.equal(response.json().error.code, 'idempotency_key_reused');
     });
 
     it('distinguishes a malformed key from a missing one', async () => {
@@ -124,8 +135,8 @@ describe('POST /orders', () => {
         payload: orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
       });
 
-      expect(response.statusCode).toBe(400);
-      expect(response.json().error.code).toBe('idempotency_key_invalid');
+      assert.equal(response.statusCode, 400);
+      assert.equal(response.json().error.code, 'idempotency_key_invalid');
     });
 
     it('requires the header', async () => {
@@ -135,8 +146,8 @@ describe('POST /orders', () => {
         payload: orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
       });
 
-      expect(response.statusCode).toBe(400);
-      expect(response.json().error.code).toBe('idempotency_key_required');
+      assert.equal(response.statusCode, 400);
+      assert.equal(response.json().error.code, 'idempotency_key_required');
     });
   });
 
@@ -151,16 +162,11 @@ describe('POST /orders', () => {
         }),
       );
 
-      expect(response.statusCode).toBe(402);
-      expect(response.json().error.code).toBe('payment_declined');
+      assert.equal(response.statusCode, 402);
+      assert.equal(response.json().error.code, 'payment_declined');
       // Nobody was charged, so the units must go back on the shelf.
-      expect(await stockOf('Newark NJ', 'WIRE-12-500')).toBe(before);
-
-      const [order] = await db
-        .select()
-        .from(orders)
-        .where(eq(orders.customerId, CUSTOMER_ID));
-      expect(order?.status).toBe('payment_failed');
+      assert.equal(await stockOf('Newark NJ', 'WIRE-12-500'), before);
+      assert.equal((await latestOrder())?.status, 'payment_failed');
     });
 
     /**
@@ -178,16 +184,13 @@ describe('POST /orders', () => {
         }),
       );
 
-      expect(response.statusCode).toBe(504);
-      expect(response.json().error.code).toBe('payment_indeterminate');
-      expect(await stockOf('Newark NJ', 'WIRE-12-500')).toBe(before - 3);
+      assert.equal(response.statusCode, 504);
+      assert.equal(response.json().error.code, 'payment_indeterminate');
+      assert.equal(await stockOf('Newark NJ', 'WIRE-12-500'), before - 3);
 
-      const [order] = await db
-        .select()
-        .from(orders)
-        .where(eq(orders.customerId, CUSTOMER_ID));
-      expect(order?.status).toBe('pending_payment');
-      expect(order?.paymentFailureReason).toBeTruthy();
+      const order = await latestOrder();
+      assert.equal(order?.status, 'pending_payment');
+      assert.ok(order?.paymentFailureReason);
     });
   });
 
@@ -200,9 +203,9 @@ describe('POST /orders', () => {
 
       const response = await app.inject({ method: 'GET', url: `/orders/${id}` });
 
-      expect(response.statusCode).toBe(200);
-      expect(response.json().id).toBe(id);
-      expect(response.json().status).toBe('paid');
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().id, id);
+      assert.equal(response.json().status, 'paid');
     });
 
     it('rejects a malformed id instead of letting the database reject it', async () => {
@@ -211,8 +214,8 @@ describe('POST /orders', () => {
         url: '/orders/not-a-uuid',
       });
 
-      expect(response.statusCode).toBe(400);
-      expect(response.json().error.code).toBe('invalid_order_id');
+      assert.equal(response.statusCode, 400);
+      assert.equal(response.json().error.code, 'invalid_order_id');
     });
 
     it('answers an unknown order with 404', async () => {
@@ -221,15 +224,15 @@ describe('POST /orders', () => {
         url: '/orders/11111111-1111-4111-8111-111111111111',
       });
 
-      expect(response.statusCode).toBe(404);
-      expect(response.json().error.code).toBe('order_not_found');
+      assert.equal(response.statusCode, 404);
+      assert.equal(response.json().error.code, 'order_not_found');
     });
 
     it('answers an unknown route in the same error shape', async () => {
       const response = await app.inject({ method: 'GET', url: '/nope' });
 
-      expect(response.statusCode).toBe(404);
-      expect(response.json().error.code).toBe('route_not_found');
+      assert.equal(response.statusCode, 404);
+      assert.equal(response.json().error.code, 'route_not_found');
     });
   });
 
@@ -242,8 +245,8 @@ describe('POST /orders', () => {
         }),
       );
 
-      expect(response.statusCode).toBe(400);
-      expect(response.json().error.code).toBe('validation_failed');
+      assert.equal(response.statusCode, 400);
+      assert.equal(response.json().error.code, 'validation_failed');
     });
 
     it('rejects duplicate order lines instead of merging them', async () => {
@@ -257,7 +260,7 @@ describe('POST /orders', () => {
         payment: { cardNumber: '4242424242424242' },
       });
 
-      expect(response.statusCode).toBe(400);
+      assert.equal(response.statusCode, 400);
     });
 
     it('rejects an unknown customer and an unknown product', async () => {
@@ -265,8 +268,8 @@ describe('POST /orders', () => {
         ...orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
         customerId: '30000000-0000-4000-8000-00000000ffff',
       });
-      expect(unknownCustomer.statusCode).toBe(404);
-      expect(unknownCustomer.json().error.code).toBe('customer_not_found');
+      assert.equal(unknownCustomer.statusCode, 404);
+      assert.equal(unknownCustomer.json().error.code, 'customer_not_found');
 
       const unknownProduct = await post({
         ...orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
@@ -274,11 +277,11 @@ describe('POST /orders', () => {
           { productId: '10000000-0000-4000-8000-00000000ffff', quantity: 1 },
         ],
       });
-      expect(unknownProduct.statusCode).toBe(404);
-      expect(unknownProduct.json().error.code).toBe('product_not_found');
+      assert.equal(unknownProduct.statusCode, 404);
+      assert.equal(unknownProduct.json().error.code, 'product_not_found');
     });
 
-    it('answers a malformed body with our error shape, not the framework\'s', async () => {
+    it("answers a malformed body with our error shape, not the framework's", async () => {
       const response = await app.inject({
         method: 'POST',
         url: '/orders',
@@ -289,8 +292,8 @@ describe('POST /orders', () => {
         payload: '{not json',
       });
 
-      expect(response.statusCode).toBe(400);
-      expect(response.json().error.code).toBe('malformed_request');
+      assert.equal(response.statusCode, 400);
+      assert.equal(response.json().error.code, 'malformed_request');
     });
 
     it('rejects a non-US address the geocoder cannot resolve', async () => {
@@ -299,8 +302,8 @@ describe('POST /orders', () => {
         shippingAddress: { ...PHILADELPHIA, country: 'UY' },
       });
 
-      expect(response.statusCode).toBe(422);
-      expect(response.json().error.code).toBe('address_not_geocodable');
+      assert.equal(response.statusCode, 422);
+      assert.equal(response.json().error.code, 'address_not_geocodable');
     });
   });
 });

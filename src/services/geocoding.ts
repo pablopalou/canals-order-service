@@ -57,7 +57,11 @@ const normalize = (address: Address) =>
   `${address.city.trim().toLowerCase()},${address.state.trim().toLowerCase()}`;
 
 export class MockGeocodingProvider implements GeocodingProvider {
-  constructor(private readonly latencyMs = 0) {}
+  private readonly latencyMs: number;
+
+  constructor(latencyMs = 0) {
+    this.latencyMs = latencyMs;
+  }
 
   async geocode(address: Address): Promise<Coordinates> {
     if (this.latencyMs > 0) {
