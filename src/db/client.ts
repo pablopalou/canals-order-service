@@ -25,6 +25,29 @@ export const pool = new pg.Pool({
   options: `-c lock_timeout=${config.DB_LOCK_TIMEOUT_MS}`,
 });
 
+/**
+ * Postgres closes idle connections when it restarts, fails over, or is simply
+ * restarted by an operator. node-postgres surfaces that as an `error` event on
+ * the pool, and an EventEmitter with no error listener throws — which would
+ * take the whole process down every time the database is bounced.
+ *
+ * The pool discards the broken client on its own and opens a fresh one on the
+ * next query, so there is nothing to do here but record it and stay alive.
+ * This is deliberately not the Fastify logger: the connection layer should not
+ * depend on the web layer, and this has to be attached the moment the pool
+ * exists, before any request can be served.
+ */
+pool.on('error', (error) => {
+  process.stderr.write(
+    `${JSON.stringify({
+      level: 50,
+      time: Date.now(),
+      msg: 'idle database connection failed; the pool will reconnect',
+      err: { type: error.name, message: error.message },
+    })}\n`,
+  );
+});
+
 export const db = drizzle(pool, { schema });
 
 export type Database = typeof db;

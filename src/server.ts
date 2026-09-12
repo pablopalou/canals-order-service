@@ -2,15 +2,18 @@ import { config } from './config.ts';
 import { db, pool } from './db/client.ts';
 import { buildApp } from './app.ts';
 import { MockGeocodingProvider } from './services/geocoding.ts';
-import { MockPaymentGateway } from './services/payments.ts';
+import { MockPaymentGateway, withTimeout } from './services/payments.ts';
 
 const app = await buildApp({
   db,
   geocoding: new MockGeocodingProvider(),
-  payments: new MockPaymentGateway({
-    latencyMs: config.PAYMENTS_LATENCY_MS,
-    failureRate: config.PAYMENTS_FAILURE_RATE,
-  }),
+  payments: withTimeout(
+    new MockPaymentGateway({
+      latencyMs: config.PAYMENTS_LATENCY_MS,
+      failureRate: config.PAYMENTS_FAILURE_RATE,
+    }),
+    config.PAYMENTS_TIMEOUT_MS,
+  ),
 });
 
 await app.listen({ port: config.PORT, host: '0.0.0.0' });

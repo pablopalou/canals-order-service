@@ -50,6 +50,12 @@ export default tseslint.config(
       '@typescript-eslint/await-thenable': 'error',
       '@typescript-eslint/return-await': ['error', 'always'],
       '@typescript-eslint/no-unnecessary-condition': 'error',
+      // The conventional opt-out: a leading underscore says "required by the
+      // signature, deliberately unused".
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
+      ],
       eqeqeq: ['error', 'always'],
       'prefer-const': 'error',
       'no-var': 'error',

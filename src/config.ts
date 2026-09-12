@@ -20,6 +20,12 @@ const envSchema = z.object({
   DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   DB_LOCK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
 
+  /**
+   * How long to wait for the payment gateway before giving up. A charge that
+   * exceeds this is treated as indeterminate, never as a failure.
+   */
+  PAYMENTS_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+
   /** Mocked payment gateway behaviour, see src/services/payments.ts */
   PAYMENTS_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
   PAYMENTS_LATENCY_MS: z.coerce.number().int().min(0).default(120),

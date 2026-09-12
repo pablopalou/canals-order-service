@@ -1,11 +1,12 @@
 import Fastify, { type FastifyInstance } from 'fastify';
+import { sql } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import { config } from './config.ts';
 import type { OrderDependencies } from './domain/orders.ts';
 
 /** Everything the domain needs except the logger, which the app supplies. */
 export type AppDependencies = Omit<OrderDependencies, 'logger'>;
-import { isAppError } from './errors.ts';
+import { isAppError, isTransientDatabaseError } from './errors.ts';
 import { registerOrderRoutes } from './routes/orders.ts';
 
 /** Methods worth reporting in an Allow header when a path exists. */
@@ -62,7 +63,30 @@ export async function buildApp(
     reply.header('x-content-type-options', 'nosniff');
   });
 
+  /**
+   * Liveness: is this process running. It deliberately touches nothing else,
+   * so a database outage does not get the container killed and restarted —
+   * restarting it would not bring the database back.
+   */
   app.get('/health', async () => ({ status: 'ok' }));
+
+  /**
+   * Readiness: can this instance actually serve a request. An orchestrator
+   * uses this to stop routing traffic here while the database is unreachable,
+   * which is the difference between a broken instance and a busy one.
+   */
+  app.get('/ready', async (_request, reply) => {
+    try {
+      await deps.db.execute(sql`select 1`);
+      return { status: 'ready' };
+    } catch (error) {
+      app.log.error({ err: error }, 'readiness check failed');
+      return await reply.code(503).header('retry-after', '2').send({
+        status: 'not_ready',
+        reason: 'database unreachable',
+      });
+    }
+  });
 
   await registerOrderRoutes(app, { ...deps, logger: app.log });
 
@@ -134,6 +158,23 @@ export async function buildApp(
         },
         requestId: request.id,
       });
+    }
+
+    // The database being briefly unreachable is not the caller's fault and is
+    // not permanent. Reporting it as a 500 tells clients and dashboards that
+    // the service is broken, when what it needs is for them to come back.
+    if (isTransientDatabaseError(error)) {
+      request.log.error({ err: error }, 'database unavailable');
+      return reply
+        .code(503)
+        .header('retry-after', '2')
+        .send({
+          error: {
+            code: 'database_unavailable',
+            message: 'The service is temporarily unable to reach its database',
+          },
+          requestId: request.id,
+        });
     }
 
     // Fastify raises its own errors before a handler ever runs: an unparseable

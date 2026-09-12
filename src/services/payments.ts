@@ -33,6 +33,46 @@ export interface PaymentGateway {
   charge(request: ChargeRequest): Promise<ChargeResult>;
 }
 
+/**
+ * Bounds a charge in time.
+ *
+ * A gateway that never answers is worse than one that refuses: without a
+ * bound, the request is held open forever, and so is every resource attached
+ * to it. Crucially the timeout resolves to `payment_indeterminate` and not to
+ * a decline — we stopped waiting, which says nothing about whether the charge
+ * went through.
+ */
+export function withTimeout(
+  gateway: PaymentGateway,
+  timeoutMs: number,
+): PaymentGateway {
+  return {
+    async charge(request: ChargeRequest): Promise<ChargeResult> {
+      let timer: NodeJS.Timeout | undefined;
+
+      const expiry = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new AppError(
+              504,
+              PAYMENT_INDETERMINATE,
+              `The payment gateway did not respond within ${timeoutMs}ms`,
+            ),
+          );
+        }, timeoutMs);
+      });
+
+      try {
+        return await Promise.race([gateway.charge(request), expiry]);
+      } finally {
+        // Without this the timer keeps the event loop alive for its full
+        // duration after a charge that answered promptly.
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
 export type MockPaymentGatewayOptions = {
   latencyMs?: number;
   /** Chaos knob: fraction of charges that time out, in [0, 1]. */

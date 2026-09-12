@@ -40,7 +40,9 @@ services:
       && node dist/db/seed.js --if-empty
       && node dist/server.js"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      # Readiness, not liveness: the container is only healthy once it can
+      # actually reach the database.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 5s
       timeout: 3s
       retries: 10

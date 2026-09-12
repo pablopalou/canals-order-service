@@ -53,7 +53,7 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test           # 77 tests
+npm test           # 82 tests
 npm run lint       # type-aware rules the compiler cannot express
 npm run typecheck
 ```
@@ -112,7 +112,17 @@ read from the catalogue, never accepted from the client.
 | 413 | `payload_too_large` | Body over 64 KB |
 | 415 | `unsupported_media_type` | Body is not JSON |
 | 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable, with `Retry-After` |
+| 503 | `database_unavailable` | The database is momentarily unreachable. Retryable, with `Retry-After` |
 | 504 | `payment_indeterminate` | Charge timed out. Stock **held**, order left `pending_payment` for reconciliation |
+
+### `GET /health` and `GET /ready`
+
+Liveness and readiness are separate on purpose. `/health` answers as long as
+the process is running and touches nothing else — restarting a container will
+not bring a database back, so an outage should not get it killed. `/ready`
+checks that the database actually answers, which is what an orchestrator needs
+in order to stop routing traffic to an instance that cannot serve it. The
+container's healthcheck uses `/ready`.
 
 ### `GET /orders/:id`
 
@@ -290,6 +300,34 @@ The intermediate `pending_payment` row is what makes this recoverable. If the
 process dies mid-flight, the order still exists and can be reconciled against
 the gateway, instead of leaving stock decremented with nothing to explain why.
 
+### Surviving things that fall over mid-request
+
+Each of these was tested by actually doing it, not by reasoning about it.
+
+**The process is killed mid-charge.** The order is already committed as
+`pending_payment` with its stock reserved, and the idempotency key exists with
+no recorded response. On restart, a client retrying that key is told
+`request_in_progress` rather than being charged a second time — verified by
+killing the process with SIGKILL during a charge, restarting, and retrying.
+
+**Postgres goes away.** An idle connection failing raises an `error` event on
+the pool, and a pool with no error listener takes the process down with it —
+which would mean every database restart, failover or maintenance window kills
+every instance. The pool now logs and keeps going: the broken client is
+discarded and a fresh one opens on the next query. During the outage `/ready`
+reports 503 and requests get `503 database_unavailable` with a `Retry-After`
+rather than a 500, and when Postgres comes back the service recovers on its
+own without a restart.
+
+**The gateway never answers.** Charges are bounded in time. The timeout
+resolves to `payment_indeterminate`, never to a decline — we stopped waiting,
+which says nothing about whether the money moved, so the reservation is held
+for reconciliation exactly as any other unknown outcome.
+
+**SIGTERM during a charge.** The in-flight order completes and the process
+exits zero. Shutdown gives up after ten seconds rather than waiting to be
+killed.
+
 ### Payment outcomes
 
 Two failure modes that must never be collapsed into one:
@@ -464,7 +502,7 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-Seventy-seven tests across six files, each covering one thing:
+Eighty-two tests across seven files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
@@ -475,6 +513,7 @@ Seventy-seven tests across six files, each covering one thing:
 | `edge-cases` | What the gateway is actually handed, distance ties, stock boundaries, replays in awkward states |
 | `money` | An order total past the 32-bit ceiling |
 | `http-semantics` | Location, 405 with Allow, cache and sniffing headers, prototype-chain payloads |
+| `resilience` | A gateway that never answers, and the liveness/readiness split |
 
 The brief says tests are optional and that they trade poorly against reviewer
 time, which is why none of them assert framework behaviour for its own sake —
