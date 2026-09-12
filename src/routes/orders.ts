@@ -1,8 +1,10 @@
 import type { FastifyInstance } from 'fastify';
-import { eq } from 'drizzle-orm';
-import { orders } from '../db/schema.ts';
 import { AppError } from '../errors.ts';
-import { createOrder, type OrderDependencies } from '../domain/orders.ts';
+import {
+  createOrder,
+  findOrder,
+  type OrderDependencies,
+} from '../domain/orders.ts';
 import { z } from 'zod';
 import { createOrderSchema, idempotencyKeySchema } from './schemas.ts';
 
@@ -54,9 +56,7 @@ export async function registerOrderRoutes(
       throw new AppError(400, 'invalid_order_id', 'Order id must be a UUID');
     }
 
-    const order = await deps.db.query.orders.findFirst({
-      where: eq(orders.id, id.data),
-    });
+    const order = await findOrder(deps.db, id.data);
 
     if (!order) {
       throw new AppError(404, 'order_not_found', 'Unknown order');

@@ -23,3 +23,15 @@ export class AppError extends Error {
 }
 
 export const isAppError = (e: unknown): e is AppError => e instanceof AppError;
+
+/**
+ * Walks the cause chain looking for a Postgres error code. Drivers and query
+ * builders wrap errors, so the code is rarely on the error actually thrown.
+ */
+export function postgresErrorCode(error: unknown): string | undefined {
+  for (let current = error; current instanceof Error; current = current.cause) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string') return code;
+  }
+  return undefined;
+}

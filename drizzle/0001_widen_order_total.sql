@@ -1,0 +1,1 @@
+ALTER TABLE "orders" ALTER COLUMN "total_cents" SET DATA TYPE bigint;

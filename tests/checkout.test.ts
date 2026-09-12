@@ -127,6 +127,23 @@ describe('POST /orders', () => {
       assert.equal(response.json().error.code, 'idempotency_key_reused');
     });
 
+    it('treats an omitted line2 and an explicit null as the same request', async () => {
+      const key = nextKey();
+      const base = orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] });
+
+      const first = await post(base, key);
+      const second = await post(
+        { ...base, shippingAddress: { ...PHILADELPHIA, line2: null } },
+        key,
+      );
+
+      assert.equal(first.statusCode, 201);
+      // A replay, not a different request: the fingerprint must not depend on
+      // whether an optional field was sent as null or left out.
+      assert.equal(second.statusCode, 201);
+      assert.deepEqual(second.json(), first.json());
+    });
+
     it('distinguishes a malformed key from a missing one', async () => {
       const response = await app.inject({
         method: 'POST',
@@ -226,6 +243,25 @@ describe('POST /orders', () => {
 
       assert.equal(response.statusCode, 404);
       assert.equal(response.json().error.code, 'order_not_found');
+    });
+
+    it('exposes only the fields it means to, not the raw row', async () => {
+      const created = await post(
+        orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: `/orders/${created.json().id}`,
+      });
+
+      const body = response.json();
+      assert.equal(body.items[0].sku, 'BRK-20A');
+      assert.equal(body.shippingAddress.city, 'Philadelphia');
+      // Internal columns must not travel: the geocoded coordinates are ours,
+      // and the gateway's failure text is not the customer's business.
+      assert.equal(body.shippingLatitude, undefined);
+      assert.equal(body.shippingLongitude, undefined);
+      assert.equal(body.paymentFailureReason, undefined);
     });
 
     it('answers an unknown route in the same error shape', async () => {

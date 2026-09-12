@@ -97,6 +97,7 @@ read from the catalogue, never accepted from the client.
 | 409 | `request_in_progress` | Same idempotency key, first attempt still running |
 | 422 | `address_not_geocodable` | The address could not be resolved |
 | 422 | `idempotency_key_reused` | Key already used with a different body |
+| 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable |
 | 504 | `payment_indeterminate` | Charge timed out. Stock **held**, order left `pending_payment` for reconciliation |
 
 ### `GET /orders/:id`
@@ -304,6 +305,36 @@ drained in between. The reservation re-checks under the lock and falls through
 to the next candidate rather than overselling — both behaviours are covered in
 `tests/concurrency.test.ts`.
 
+### Security
+
+Nothing here is auth — the brief sets that aside — but the parts that are not
+auth were still treated as if this were live:
+
+- **The card number never lands anywhere.** It is validated, handed to the
+  gateway, and discarded. The database keeps four digits; the logger redacts
+  the field on every path, so a future log line cannot leak one by accident.
+- **Prices are server-side.** There is no price field in the request for a
+  client to tamper with.
+- **The read endpoint lists its columns explicitly** rather than returning the
+  row. A handler that publishes whatever the table happens to hold will
+  publish the next column somebody adds, and the geocoded coordinates are
+  ours, not the customer's business.
+- **Errors say what the client did wrong and nothing else.** Unrecognised
+  failures are logged in full and returned as an opaque 500 with a request id
+  to correlate against.
+- **Everything is parameterised.** No string interpolation reaches SQL,
+  including the generated `values` lists.
+- **The body limit is 64 KB** and orders cap at 200 lines, so a hostile
+  payload is rejected before it is parsed.
+- **Queries are bounded**: ten seconds per statement, five for a row lock. A
+  request cannot pin a connection or a lock indefinitely.
+
+Known gaps, all of them consequences of having no auth in scope: anyone
+holding an order's UUID can read it, error codes distinguish an unknown
+customer from an unknown product, and there is no rate limiting. In a real
+deployment the endpoint sits behind authentication, orders are scoped to the
+authenticated customer, and the write path is rate limited per customer.
+
 ### Idempotency
 
 The header is **required**, not optional. This endpoint is called by a UI when
@@ -330,7 +361,9 @@ order.
 ### Data
 
 - **Money is integer cents.** Floating point rounding errors compound across
-  order lines.
+  order lines. Per-unit prices are 32-bit; order totals are 64-bit, because a
+  200-line order of a high-priced SKU passes the 21 million dollar ceiling of
+  an integer column, and a valid order must not fail on an overflow.
 - **`order_items` snapshots the unit price.** Reading it by joining to
   `products` would silently rewrite historical orders whenever a catalogue
   price changes.
@@ -399,7 +432,10 @@ In rough order of how much they would matter in production:
 - **Observability.** Structured logs are in place; what is missing is metrics
   on reservation failures, payment latency and 409 rates, which are the
   numbers that tell you inventory is misallocated across the network.
-- **Pagination and auth** on the read endpoint, out of scope here.
+- **Rate limiting and authentication**, per the note above.
+- **Expiring idempotency keys.** They are kept forever today; production wants
+  a retention window and a sweep, since their only purpose is to cover a
+  client's retry window.
 
 ## A note on tooling
 

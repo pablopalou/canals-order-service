@@ -2,13 +2,19 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { ZodError } from 'zod';
 import { config } from './config.ts';
 import type { OrderDependencies } from './domain/orders.ts';
+
+/** Everything the domain needs except the logger, which the app supplies. */
+export type AppDependencies = Omit<OrderDependencies, 'logger'>;
 import { isAppError } from './errors.ts';
 import { registerOrderRoutes } from './routes/orders.ts';
 
 export async function buildApp(
-  deps: OrderDependencies,
+  deps: AppDependencies,
 ): Promise<FastifyInstance> {
   const app = Fastify({
+    // A valid order is a few kilobytes. Fastify defaults to a megabyte;
+    // stating the limit keeps a hostile body from being parsed at all.
+    bodyLimit: 64 * 1024,
     logger: {
       level: config.LOG_LEVEL,
       // Card numbers must never reach a log sink, an error tracker, or a
@@ -33,7 +39,7 @@ export async function buildApp(
 
   app.get('/health', async () => ({ status: 'ok' }));
 
-  await registerOrderRoutes(app, deps);
+  await registerOrderRoutes(app, { ...deps, logger: app.log });
 
   app.setNotFoundHandler((request, reply) =>
     reply.code(404).send({

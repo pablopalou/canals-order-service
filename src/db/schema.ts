@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import {
+  bigint,
   check,
   doublePrecision,
   index,
@@ -16,8 +17,15 @@ import {
 /**
  * Money is stored as integer cents. Floating point is never acceptable for
  * money: 0.1 + 0.2 !== 0.3 and rounding errors compound across order lines.
+ *
+ * Per-unit prices fit comfortably in 32 bits. Order totals do not: a 200-line
+ * order of a high-priced SKU passes 21 million dollars, where an integer
+ * column overflows and the insert fails. Totals are therefore 64-bit, which
+ * JavaScript can still represent exactly (Number.MAX_SAFE_INTEGER is about
+ * 90 trillion dollars in cents).
  */
 const cents = (name: string) => integer(name);
+const totalCents = (name: string) => bigint(name, { mode: 'number' });
 
 const createdAt = timestamp('created_at', { withTimezone: true })
   .notNull()
@@ -114,7 +122,7 @@ export const orders = pgTable(
     shippingLatitude: doublePrecision('shipping_latitude').notNull(),
     shippingLongitude: doublePrecision('shipping_longitude').notNull(),
 
-    totalCents: cents('total_cents').notNull(),
+    totalCents: totalCents('total_cents').notNull(),
     currency: text('currency').notNull().default('USD'),
 
     // PCI: the PAN is never persisted or logged. Only the last four digits are

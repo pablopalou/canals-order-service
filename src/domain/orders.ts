@@ -9,8 +9,12 @@ import {
   orders,
   products,
 } from '../db/schema.ts';
-import { AppError } from '../errors.ts';
-import type { Address, GeocodingProvider } from '../services/geocoding.ts';
+import { AppError, postgresErrorCode } from '../errors.ts';
+import type {
+  Address,
+  Coordinates,
+  GeocodingProvider,
+} from '../services/geocoding.ts';
 import {
   PAYMENT_INDETERMINATE,
   type PaymentGateway,
@@ -18,20 +22,7 @@ import {
 import { findEligibleWarehouses } from './warehouse-selection.ts';
 
 const PG_UNIQUE_VIOLATION = '23505';
-
-/**
- * Drizzle wraps driver errors, so the Postgres error code is not on the error
- * it throws but somewhere down its cause chain. Matching only the top-level
- * error silently turns an expected duplicate-key conflict into a 500.
- */
-function isUniqueViolation(error: unknown): boolean {
-  for (let current = error; current instanceof Error; current = current.cause) {
-    if ((current as { code?: unknown }).code === PG_UNIQUE_VIOLATION) {
-      return true;
-    }
-  }
-  return false;
-}
+const PG_LOCK_NOT_AVAILABLE = '55P03';
 
 export type CreateOrderInput = {
   customerId: string;
@@ -58,26 +49,51 @@ export type OrderResponse = {
   createdAt: string;
 };
 
+/**
+ * The subset of a logger this module needs. Depending on the shape rather
+ * than on Fastify's logger keeps the domain free of the web framework.
+ */
+export type Logger = {
+  error(context: Record<string, unknown>, message: string): void;
+};
+
 export type OrderDependencies = {
   db: Database;
   geocoding: GeocodingProvider;
   payments: PaymentGateway;
+  logger: Logger;
 };
 
-/** Stable fingerprint of the request an idempotency key was first used with. */
-const fingerprint = (input: CreateOrderInput): string =>
-  createHash('sha256')
-    .update(
-      JSON.stringify({
-        customerId: input.customerId,
-        shippingAddress: input.shippingAddress,
-        items: [...input.items].sort((a, b) =>
-          a.productId.localeCompare(b.productId),
-        ),
-        cardLast4: input.payment.cardNumber.slice(-4),
-      }),
-    )
-    .digest('hex');
+/**
+ * Stable fingerprint of the request an idempotency key was first used with.
+ *
+ * Every field is written out in a fixed order rather than spread from the
+ * parsed body, because JSON.stringify serialises keys in insertion order: an
+ * address whose optional line2 was omitted produces a different string from
+ * the same address that sent line2 as null, and the two would be reported as
+ * a key reused with a different body. Lines are sorted for the same reason —
+ * the same cart in a different order is the same cart.
+ */
+const fingerprint = (input: CreateOrderInput): string => {
+  const address = input.shippingAddress;
+  const canonical = {
+    customerId: input.customerId,
+    shippingAddress: [
+      address.line1,
+      address.line2 ?? null,
+      address.city,
+      address.state,
+      address.postalCode,
+      address.country,
+    ],
+    items: [...input.items]
+      .map((item) => [item.productId, item.quantity] as const)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    cardLast4: input.payment.cardNumber.slice(-4),
+  };
+
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+};
 
 /**
  * Places an order.
@@ -108,46 +124,7 @@ export async function createOrder(
   // Geocoding is an external call, so it happens before the transaction opens.
   const destination = await deps.geocoding.geocode(input.shippingAddress);
 
-  const reserved = await deps.db.transaction(async (tx) => {
-    await claimIdempotencyKey(tx, idempotencyKey, input);
-
-    const catalogue = await loadCatalogue(tx, input);
-    const candidates = await findEligibleWarehouses(
-      tx,
-      input.items,
-      destination,
-    );
-
-    if (candidates.length === 0) {
-      throw new AppError(
-        409,
-        'no_eligible_warehouse',
-        'No single warehouse can fulfil every line of this order',
-      );
-    }
-
-    for (const candidate of candidates) {
-      const secured = await reserveStock(tx, candidate.id, input.items);
-      if (!secured) continue;
-
-      const { order, lines } = await insertOrder(tx, {
-        input,
-        catalogue,
-        destination,
-        warehouseId: candidate.id,
-      });
-      return { order, warehouse: candidate, lines };
-    }
-
-    // Every candidate was drained by a concurrent order between the read and
-    // the lock. Reporting it as a conflict lets the client retry with a fresh
-    // idempotency key against current stock.
-    throw new AppError(
-      409,
-      'no_eligible_warehouse',
-      'No single warehouse can fulfil every line of this order',
-    );
-  });
+  const reserved = await reserveOrder(deps, input, destination, idempotencyKey);
 
   return settlePayment(
     deps,
@@ -155,6 +132,78 @@ export async function createOrder(
     reserved,
     input.payment.cardNumber,
   );
+}
+
+const noEligibleWarehouse = () =>
+  new AppError(
+    409,
+    'no_eligible_warehouse',
+    'No single warehouse can fulfil every line of this order',
+  );
+
+/**
+ * Step one: claim the idempotency key, choose a warehouse, take the stock and
+ * write the order, all in one transaction. Either the whole reservation
+ * exists after this returns, or none of it does.
+ */
+async function reserveOrder(
+  deps: OrderDependencies,
+  input: CreateOrderInput,
+  destination: Coordinates,
+  idempotencyKey: string,
+): Promise<ReservedOrder> {
+  return withLockContentionMapped(() =>
+    deps.db.transaction(async (tx) => {
+      await claimIdempotencyKey(tx, idempotencyKey, input);
+      await assertCustomerExists(tx, input.customerId);
+      const catalogue = await loadCatalogue(tx, input.items);
+
+      const candidates = await findEligibleWarehouses(
+        tx,
+        input.items,
+        destination,
+      );
+      if (candidates.length === 0) throw noEligibleWarehouse();
+
+      for (const candidate of candidates) {
+        const secured = await reserveStock(tx, candidate.id, input.items);
+        if (!secured) continue;
+
+        const { order, lines } = await insertOrder(tx, {
+          input,
+          catalogue,
+          destination,
+          warehouseId: candidate.id,
+        });
+        return { order, warehouse: candidate, lines };
+      }
+
+      // Every candidate was drained by a concurrent order between the
+      // eligibility read and the lock. A conflict lets the client retry with a
+      // fresh idempotency key against current stock.
+      throw noEligibleWarehouse();
+    }),
+  );
+}
+
+/**
+ * A checkout that waited too long for a row lock is not a server fault: some
+ * other order is holding the same SKU. Saying so, with a status the client
+ * knows to retry, beats an opaque 500.
+ */
+async function withLockContentionMapped<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (postgresErrorCode(error) === PG_LOCK_NOT_AVAILABLE) {
+      throw new AppError(
+        503,
+        'stock_contended',
+        'The requested stock is being updated by another order. Retry shortly.',
+      );
+    }
+    throw error;
+  }
 }
 
 /**
@@ -213,7 +262,7 @@ async function claimIdempotencyKey(
       .values({ key, requestFingerprint: fingerprint(input) });
   } catch (error) {
     // Two identical requests raced past findReplay; the loser stops here.
-    if (isUniqueViolation(error)) {
+    if (postgresErrorCode(error) === PG_UNIQUE_VIOLATION) {
       throw new AppError(
         409,
         'request_in_progress',
@@ -231,20 +280,25 @@ type Catalogue = Map<string, { sku: string; priceCents: number }>;
  * client-supplied amount is how an order for a $6,499 torch kit gets charged
  * as $0.01.
  */
-async function loadCatalogue(
+async function assertCustomerExists(
   tx: Transaction,
-  input: CreateOrderInput,
-): Promise<Catalogue> {
+  customerId: string,
+): Promise<void> {
   const [customer] = await tx
     .select({ id: customers.id })
     .from(customers)
-    .where(eq(customers.id, input.customerId));
+    .where(eq(customers.id, customerId));
 
   if (!customer) {
     throw new AppError(404, 'customer_not_found', 'Unknown customer');
   }
+}
 
-  const ids = input.items.map((item) => item.productId);
+async function loadCatalogue(
+  tx: Transaction,
+  items: CreateOrderInput['items'],
+): Promise<Catalogue> {
+  const ids = items.map((item) => item.productId);
   const rows = await tx
     .select({
       id: products.id,
@@ -271,8 +325,13 @@ async function loadCatalogue(
 /**
  * Locks the warehouse's rows for the requested products and decrements them.
  *
- * Rows are locked in a fixed order (by product id) so that two orders sharing
- * products can never take the same locks in opposite order and deadlock.
+ * The `order by product_id` on the locking select is what prevents deadlocks:
+ * Postgres plans it as LockRows above Sort, so rows are locked in product id
+ * order no matter what order the client listed them in. Two orders sharing
+ * products therefore always contend in the same direction; one waits, neither
+ * deadlocks. (`explain` on that statement shows the LockRows node sitting
+ * above the Sort.)
+ *
  * Returns false when the warehouse no longer has enough stock, which is
  * possible even though it qualified moments ago: the eligibility query ran
  * before any lock was held.
@@ -282,7 +341,7 @@ async function reserveStock(
   warehouseId: string,
   items: CreateOrderInput['items'],
 ): Promise<boolean> {
-  const ordered = [...items].sort((a, b) => a.productId.localeCompare(b.productId));
+  const productIds = items.map((item) => item.productId);
 
   const locked = await tx
     .select({
@@ -293,17 +352,14 @@ async function reserveStock(
     .where(
       and(
         eq(inventory.warehouseId, warehouseId),
-        inArray(
-          inventory.productId,
-          ordered.map((item) => item.productId),
-        ),
+        inArray(inventory.productId, productIds),
       ),
     )
     .orderBy(inventory.productId)
     .for('update');
 
   const onHand = new Map(locked.map((row) => [row.productId, row.quantity]));
-  const sufficient = ordered.every(
+  const sufficient = items.every(
     (item) => (onHand.get(item.productId) ?? 0) >= item.quantity,
   );
   if (!sufficient) return false;
@@ -312,7 +368,7 @@ async function reserveStock(
     update inventory as i
     set quantity = i.quantity - v.quantity, updated_at = now()
     from (values ${sql.join(
-      ordered.map(
+      items.map(
         (item) => sql`(${item.productId}::uuid, ${item.quantity}::integer)`,
       ),
       sql`, `,
@@ -440,7 +496,24 @@ async function settlePayment(
       throw error;
     }
 
-    await releaseReservation(deps, idempotencyKey, reserved, error);
+    // If the compensation itself fails, the payment error is still the truth
+    // the caller needs. Letting the secondary failure propagate would report a
+    // declined card as an internal error and lose the reason entirely. The
+    // stranded reservation is logged loudly and is the reconciliation
+    // worker's to resolve.
+    try {
+      await releaseReservation(deps, idempotencyKey, reserved, error);
+    } catch (compensationError) {
+      deps.logger.error(
+        {
+          err: compensationError,
+          orderId: order.id,
+          warehouseId: order.warehouseId,
+          originalError: error instanceof Error ? error.message : String(error),
+        },
+        'failed to release reservation after a failed charge; stock is stranded',
+      );
+    }
     throw error;
   }
 
@@ -451,7 +524,7 @@ async function settlePayment(
       .where(eq(orders.id, order.id))
       .returning();
 
-    const body = toOrderResponse(settled!, reserved);
+    const body = toOrderResponse(settled!, reserved.warehouse, reserved.lines);
     await tx
       .update(idempotencyKeys)
       .set({ orderId: order.id, responseStatus: 201, responseBody: body })
@@ -521,20 +594,86 @@ async function releaseReservation(
   });
 }
 
+export type OrderView = {
+  id: string;
+  status: OrderResponse['status'];
+  customerId: string;
+  warehouseId: string;
+  shippingAddress: Address;
+  items: Array<{ productId: string; sku: string; quantity: number; unitPriceCents: number }>;
+  totalCents: number;
+  currency: string;
+  cardLast4: string;
+  paymentId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/**
+ * Reads an order back.
+ *
+ * The columns are listed explicitly rather than returning the row: a table
+ * grows columns over time, and a handler that spreads whatever the database
+ * happens to hold will publish the next one by accident. The geocoded
+ * coordinates and the gateway's failure text stay internal.
+ */
+export async function findOrder(
+  db: Database,
+  id: string,
+): Promise<OrderView | null> {
+  const [order] = await db.select().from(orders).where(eq(orders.id, id));
+  if (!order) return null;
+
+  const lines = await db
+    .select({
+      productId: orderItems.productId,
+      sku: products.sku,
+      quantity: orderItems.quantity,
+      unitPriceCents: orderItems.unitPriceCents,
+    })
+    .from(orderItems)
+    .innerJoin(products, eq(products.id, orderItems.productId))
+    .where(eq(orderItems.orderId, order.id))
+    .orderBy(products.sku);
+
+  return {
+    id: order.id,
+    status: order.status,
+    customerId: order.customerId,
+    warehouseId: order.warehouseId,
+    shippingAddress: {
+      line1: order.shippingLine1,
+      line2: order.shippingLine2,
+      city: order.shippingCity,
+      state: order.shippingState,
+      postalCode: order.shippingPostalCode,
+      country: order.shippingCountry,
+    },
+    items: lines,
+    totalCents: order.totalCents,
+    currency: order.currency,
+    cardLast4: order.cardLast4,
+    paymentId: order.paymentId,
+    createdAt: order.createdAt.toISOString(),
+    updatedAt: order.updatedAt.toISOString(),
+  };
+}
+
 function toOrderResponse(
   order: typeof orders.$inferSelect,
-  reserved: ReservedOrder,
+  warehouse: ReservedOrder['warehouse'],
+  lines: OrderLine[],
 ): OrderResponse {
   return {
     id: order.id,
     status: order.status,
     customerId: order.customerId,
     warehouse: {
-      id: reserved.warehouse.id,
-      name: reserved.warehouse.name,
-      distanceKm: Math.round(reserved.warehouse.distanceKm * 10) / 10,
+      id: warehouse.id,
+      name: warehouse.name,
+      distanceKm: Math.round(warehouse.distanceKm * 10) / 10,
     },
-    items: reserved.lines,
+    items: lines,
     totalCents: order.totalCents,
     currency: order.currency,
     paymentId: order.paymentId,

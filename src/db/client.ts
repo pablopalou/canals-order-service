@@ -18,6 +18,11 @@ export const pool = new pg.Pool({
   // A request that reserves stock holds row locks; a query that hangs would
   // hold them indefinitely, so we bound it well under the HTTP timeout.
   statement_timeout: 10_000,
+  // Separately from the statement budget, never queue behind a row lock for
+  // more than a few seconds. Under heavy contention on one popular SKU,
+  // failing fast with a retryable answer beats every worker blocking on the
+  // same row until the pool is exhausted.
+  options: '-c lock_timeout=5000',
 });
 
 export const db = drizzle(pool, { schema });
