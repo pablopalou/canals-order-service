@@ -53,7 +53,7 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test           # 82 tests
+npm test           # 84 tests
 npm run lint       # type-aware rules the compiler cannot express
 npm run typecheck
 ```
@@ -310,11 +310,16 @@ no recorded response. On restart, a client retrying that key is told
 `request_in_progress` rather than being charged a second time — verified by
 killing the process with SIGKILL during a charge, restarting, and retrying.
 
-**Postgres goes away.** An idle connection failing raises an `error` event on
+**Postgres goes away, including mid-transaction.** An idle connection failing raises an `error` event on
 the pool, and a pool with no error listener takes the process down with it —
 which would mean every database restart, failover or maintenance window kills
-every instance. The pool now logs and keeps going: the broken client is
-discarded and a fresh one opens on the next query. During the outage `/ready`
+every instance. A pool also only speaks for its *idle* clients: one checked
+out for a transaction emits its failure on itself, so a hard kill in the
+middle of one was a second way to the same crash. Every connection now carries
+an error listener, and the pool discards the broken client and opens a fresh
+one on the next query. Killing Postgres outright while a transaction was
+blocked on a row lock leaves the caller with a 503, the process alive, and
+nothing committed. During the outage `/ready`
 reports 503 and requests get `503 database_unavailable` with a `Retry-After`
 rather than a 500, and when Postgres comes back the service recovers on its
 own without a restart.
@@ -323,6 +328,23 @@ own without a restart.
 resolves to `payment_indeterminate`, never to a decline — we stopped waiting,
 which says nothing about whether the money moved, so the reservation is held
 for reconciliation exactly as any other unknown outcome.
+
+**A client hangs up mid-charge.** The order completes anyway, and replaying
+the idempotency key hands the caller the finished order rather than starting a
+second one — which is the whole point of the key, since a client that gave up
+has no idea whether the charge happened.
+
+**Concurrent migrations.** A deploy starts every replica at once and each runs
+the migrator, but Postgres DDL is not concurrency safe: even `create schema if
+not exists` raises a duplicate key error when two sessions run it at the same
+instant. Three replicas from an empty database used to leave two dead on
+arrival. Migrations run under an advisory lock, and five simultaneous
+instances all succeed.
+
+**A connection held open and never used.** Node does not time out an
+incomplete request, so headers followed by silence pinned a socket
+indefinitely. A thirty second request timeout closes them, and it does not
+bound handler time — a checkout waiting on a slow gateway is unaffected.
 
 **SIGTERM during a charge.** The in-flight order completes and the process
 exits zero. Shutdown gives up after ten seconds rather than waiting to be
@@ -380,8 +402,12 @@ auth were still treated as if this were live:
   including the generated `values` lists.
 - **The body limit is 64 KB** and orders cap at 200 lines, so a hostile
   payload is rejected before it is parsed.
-- **Queries are bounded**: ten seconds per statement, five for a row lock. A
-  request cannot pin a connection or a lock indefinitely.
+- **Everything is bounded**: ten seconds per statement, five waiting for a row
+  lock, thirty for an idle transaction, thirty to deliver a request. Neither a
+  slow client nor a stuck transaction can hold a resource indefinitely.
+- **Control characters are rejected at validation.** A NUL byte cannot be
+  stored in a Postgres text column, and letting it get that far turns a bad
+  request into a 500.
 - **Bodies reaching the prototype chain are refused.** Fastify parses with
   secure-json-parse, and a test asserts it rather than leaving it to luck.
 - **Responses carry `X-Content-Type-Options: nosniff`**, and orders carry
@@ -502,7 +528,7 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-Eighty-two tests across seven files, each covering one thing:
+Eighty-four tests across seven files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
