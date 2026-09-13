@@ -31,6 +31,11 @@ services:
       NODE_ENV: production
       LOG_LEVEL: info
       PAYMENTS_LATENCY_MS: "120"
+      # Overridable from the shell to watch reconciliation in seconds rather
+      # than minutes; see "Try it" in the README.
+      PAYMENTS_TIMEOUT_MS: ${PAYMENTS_TIMEOUT_MS:-15000}
+      RECONCILE_AFTER_MS: ${RECONCILE_AFTER_MS:-300000}
+      RECONCILE_INTERVAL_MS: ${RECONCILE_INTERVAL_MS:-30000}
     ports:
       - "3000:3000"
     # Migrations run on start; the seed only populates an empty catalogue, so

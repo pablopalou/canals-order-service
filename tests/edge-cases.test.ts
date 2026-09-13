@@ -41,7 +41,11 @@ class RecordingGateway implements PaymentGateway {
 
   async charge(request: ChargeRequest): Promise<ChargeResult> {
     this.charges.push(request);
-    return { paymentId: 'pay_recorded' };
+    return await Promise.resolve({ paymentId: 'pay_recorded' });
+  }
+
+  async findCharge(): Promise<ChargeResult | null> {
+    return await Promise.resolve(null);
   }
 }
 

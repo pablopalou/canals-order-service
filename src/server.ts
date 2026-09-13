@@ -1,22 +1,39 @@
 import { config } from './config.ts';
 import { db, pool } from './db/client.ts';
 import { buildApp } from './app.ts';
+import { startReconciler } from './domain/reconciliation.ts';
 import { MockGeocodingProvider } from './services/geocoding.ts';
 import { MockPaymentGateway, withTimeout } from './services/payments.ts';
+
+// One gateway client shared by checkout and reconciliation. With the mock this
+// is also what lets reconciliation see the charges checkout made.
+const payments = withTimeout(
+  new MockPaymentGateway({
+    latencyMs: config.PAYMENTS_LATENCY_MS,
+    failureRate: config.PAYMENTS_FAILURE_RATE,
+  }),
+  config.PAYMENTS_TIMEOUT_MS,
+);
 
 const app = await buildApp({
   db,
   geocoding: new MockGeocodingProvider(),
-  payments: withTimeout(
-    new MockPaymentGateway({
-      latencyMs: config.PAYMENTS_LATENCY_MS,
-      failureRate: config.PAYMENTS_FAILURE_RATE,
-    }),
-    config.PAYMENTS_TIMEOUT_MS,
-  ),
+  payments,
 });
 
 await app.listen({ port: config.PORT, host: '0.0.0.0' });
+
+const reconciler =
+  config.RECONCILE_INTERVAL_MS > 0
+    ? startReconciler(
+        { db, payments, logger: app.log },
+        {
+          intervalMs: config.RECONCILE_INTERVAL_MS,
+          olderThanMs: config.RECONCILE_AFTER_MS,
+          batchSize: config.RECONCILE_BATCH_SIZE,
+        },
+      )
+    : null;
 
 /**
  * A rejection nobody awaited is a bug, and Node's default is to terminate on
@@ -40,6 +57,8 @@ process.on('uncaughtException', (error) => {
 async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, 'shutting down');
   try {
+    // Reconciliation first, so no new pass starts while requests drain.
+    if (reconciler) await reconciler.stop();
     await app.close();
     await pool.end();
     process.exit(0);

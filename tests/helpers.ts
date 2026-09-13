@@ -41,7 +41,10 @@ export const CUSTOMER_ID = '30000000-0000-4000-8000-000000000001';
 /** Passes the Luhn check; the mock gateway approves anything not marked. */
 export const GOOD_CARD = '4242424242424242';
 export const DECLINED_CARD = '4000000000000002';
+/** Times out before reaching the gateway: nothing is charged. */
 export const TIMEOUT_CARD = '4000000000000069';
+/** Charges, then the response is lost: the caller sees the same timeout. */
+export const LOST_RESPONSE_CARD = '4000000000000077';
 
 export const PHILADELPHIA = {
   line1: '1600 Market St',

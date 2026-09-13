@@ -53,7 +53,7 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test           # 84 tests
+npm test           # 92 tests
 npm run lint       # type-aware rules the compiler cannot express
 npm run typecheck
 ```
@@ -103,9 +103,10 @@ read from the catalogue, never accepted from the client.
 | 400 | `idempotency_key_required` / `idempotency_key_invalid` | Header missing, or present but too short |
 | 400 | `invalid_order_id` | The id on `GET /orders/:id` is not a UUID |
 | 402 | `payment_declined` | The issuer said no. Stock released, order marked `payment_failed` |
+| 402 | `payment_not_completed` | Replayed key for an order reconciliation cancelled: the gateway held no charge |
 | 404 | `customer_not_found` / `product_not_found` | Unknown id |
 | 409 | `no_eligible_warehouse` | No single warehouse holds every line in the required quantity |
-| 409 | `request_in_progress` | Same idempotency key, first attempt still running |
+| 409 | `request_in_progress` | Same idempotency key, first attempt still running — or its charge outcome is still being reconciled |
 | 422 | `address_not_geocodable` | The address could not be resolved |
 | 422 | `idempotency_key_reused` | Key already used with a different body |
 | 405 | `method_not_allowed` | Path exists under another method; the `Allow` header lists which |
@@ -113,7 +114,7 @@ read from the catalogue, never accepted from the client.
 | 415 | `unsupported_media_type` | Body is not JSON |
 | 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable, with `Retry-After` |
 | 503 | `database_unavailable` | The database is momentarily unreachable. Retryable, with `Retry-After` |
-| 504 | `payment_indeterminate` | Charge timed out. Stock **held**, order left `pending_payment` for reconciliation |
+| 504 | `payment_indeterminate` | Charge outcome unknown. Stock **held**, order left `pending_payment` until [reconciliation](#reconciliation) resolves it |
 
 ### `GET /health` and `GET /ready`
 
@@ -140,7 +141,11 @@ branch is reachable from curl without editing code.
 | --- | --- |
 | `4242 4242 4242 4242` | Approved |
 | `4000 0000 0000 0002` | Declined |
-| `4000 0000 0000 0069` | Times out (indeterminate) |
+| `4000 0000 0000 0069` | Times out before reaching the gateway: **nothing charged** |
+| `4000 0000 0000 0077` | Charges, then the response is lost: **charged** |
+
+The last two are indistinguishable to the caller — both are a 504 — which is
+the entire problem reconciliation exists for.
 
 Any Luhn-valid number is approved. Numbers failing the Luhn check are rejected
 before the gateway is called at all.
@@ -236,7 +241,23 @@ docker compose exec postgres psql -U orders -d orders \
 Use `4000000000000069`. You get `504`, and the order stays `pending_payment`
 with its stock still reserved. See [Payment outcomes](#payment-outcomes).
 
-### 5. Eight customers, one unit
+### 5. Reconciliation settles what the request could not
+
+Reconciliation waits five minutes by default. To watch it within seconds,
+start the stack with short thresholds:
+
+```bash
+PAYMENTS_TIMEOUT_MS=2000 RECONCILE_AFTER_MS=4000 RECONCILE_INTERVAL_MS=1000 docker compose up
+```
+
+Place one order with `4000000000000077` (charged, response lost) and one with
+`4000000000000069` (never charged). Both answer `504` and both orders sit in
+`pending_payment` with their stock reserved. A few seconds later the first is
+`paid` and the second is `payment_failed` with its units back on the shelf.
+Replaying each order's idempotency key now returns that real outcome instead
+of `request_in_progress`.
+
+### 6. Eight customers, one unit
 
 ```bash
 ./scripts/race.sh
@@ -297,8 +318,9 @@ would hold row locks on inventory for the duration of somebody else's HTTP
 request, which is how a checkout endpoint takes a database down under load.
 
 The intermediate `pending_payment` row is what makes this recoverable. If the
-process dies mid-flight, the order still exists and can be reconciled against
-the gateway, instead of leaving stock decremented with nothing to explain why.
+process dies mid-flight, the order still exists and reconciliation resolves it
+against the gateway, instead of leaving stock decremented with nothing to
+explain why.
 
 ### Surviving things that fall over mid-request
 
@@ -308,7 +330,8 @@ Each of these was tested by actually doing it, not by reasoning about it.
 `pending_payment` with its stock reserved, and the idempotency key exists with
 no recorded response. On restart, a client retrying that key is told
 `request_in_progress` rather than being charged a second time — verified by
-killing the process with SIGKILL during a charge, restarting, and retrying.
+killing the process with SIGKILL during a charge, restarting, and retrying —
+and reconciliation later settles the order either way.
 
 **Postgres goes away, including mid-transaction.** An idle connection failing raises an `error` event on
 the pool, and a pool with no error listener takes the process down with it —
@@ -360,9 +383,51 @@ Two failure modes that must never be collapsed into one:
   have happened. The reservation is deliberately **not** released and the
   order stays `pending_payment`. Releasing stock while the customer's card was
   in fact debited is the one outcome that costs real money and real trust.
-  Recovery is a reconciliation worker that replays the same idempotency key
-  against the gateway, which either returns the original charge or confirms
-  none exists.
+  Reconciliation later asks the gateway what became of it.
+
+### Reconciliation
+
+An order whose charge outcome is unknown holds its stock, correctly — but held
+forever it would starve every other customer. A reconciler resolves those
+orders by asking the gateway what actually happened.
+
+**It asks rather than retries.** Charging again under the same idempotency key
+would be the obvious move, but a charge needs the card number, and that is
+never stored. The gateway client therefore exposes a lookup by idempotency key
+(real processors support this by payment reference). The consequence of the
+PCI decision is a design constraint here, and a good one: reconciliation can
+confirm or deny a charge, never create one.
+
+**It waits before asking.** Only orders untouched for `RECONCILE_AFTER_MS`
+(five minutes by default) are considered. Asking about a charge still on its
+way to the gateway would be told none exists, cancel the order, and then watch
+the charge land. Configuration refuses a threshold under twice the payment
+timeout.
+
+**It is safe to run on every replica.** Each pass claims a batch with
+`for update skip locked`, so concurrent passes step over rows another is
+already claiming instead of waiting on them, and the claim bumps `updated_at`
+as a lease: a claimed order does not look stuck again until a full threshold
+has passed. Nothing is held open during the gateway calls that follow. If a
+pass dies partway, its orders simply become eligible again.
+
+**Settlement is guarded.** Every transition out of `pending_payment` is
+conditional on the order still being pending, and cancelling gates releasing
+the stock. The original request settling late and a reconciler settling the
+same order cannot both win, and units are returned at most once. If a charge
+does land for an order reconciliation already cancelled — which the threshold
+exists to prevent — it is logged as needing a refund rather than swallowed.
+
+For each claimed order:
+
+| The gateway says | Result |
+| --- | --- |
+| The charge exists | Order `paid`; replaying the key returns it |
+| No charge exists | Order `payment_failed`, stock released; replaying the key returns `402 payment_not_completed` |
+| Nothing — it cannot be reached | Order left pending and retried next pass; after ten attempts it is logged as needing attention |
+
+It runs every `RECONCILE_INTERVAL_MS` inside the service, never overlapping
+itself, and shutdown lets a pass in flight finish before draining requests.
 
 ### Concurrency
 
@@ -512,6 +577,13 @@ prefix now would be ceremony; adding it later is a routing change.
 Both third parties sit behind an interface, so a real client can replace them
 without touching the checkout logic.
 
+The payment mock keeps its charges in memory, per process. That is faithful
+enough for one instance, but it is not a shared ledger: scaled to several
+replicas, one replica's reconciler would not see a charge another made and
+would cancel a paid order, and a retry landing on a different replica would
+be charged again. A real gateway is the shared ledger this stands in for. With
+the mock, run a single instance.
+
 The geocoder is deterministic rather than random: a given address must always
 resolve to the same point, otherwise the chosen warehouse is not reproducible
 and neither the examples above nor the tests mean anything. Known US metros
@@ -528,7 +600,7 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-Eighty-four tests across seven files, each covering one thing:
+Ninety-two tests across eight files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
@@ -540,6 +612,7 @@ Eighty-four tests across seven files, each covering one thing:
 | `money` | An order total past the 32-bit ceiling |
 | `http-semantics` | Location, 405 with Allow, cache and sniffing headers, prototype-chain payloads |
 | `resilience` | A gateway that never answers, and the liveness/readiness split |
+| `reconciliation` | A lost response confirmed, a missing charge cancelled, recent orders left alone, an unreachable gateway retried and escalated, overlapping passes settling each order once |
 
 The brief says tests are optional and that they trade poorly against reviewer
 time, which is why none of them assert framework behaviour for its own sake —
@@ -556,7 +629,10 @@ afterwards every unit is accounted for —
     stock now + units held by paid orders === stock before
 
 Any lost update, double decrement, or compensation that released the wrong
-quantity breaks that equality. The suite was run five times in a row to
+quantity breaks that equality. The reconciliation tests were also checked
+against deliberately broken code — the pending guard removed, the claim
+stripped of `skip locked` and its lease, a missing charge treated as paid —
+and each mutation is caught. The suite was run five times in a row to
 confirm nothing in it is timing-dependent, and it runs against the service's
 own connection pool rather than one built for tests — a pool with different
 timeouts would be exercising something the service never runs. Pool size and
@@ -569,12 +645,6 @@ lock budget without changing what the contention test proves.
 
 In rough order of how much they would matter in production:
 
-- **Reconciliation worker.** Orders stuck in `pending_payment` past a
-  threshold should be replayed against the gateway and settled or released.
-  Today the recovery path is designed for but not implemented, so such an
-  order holds its stock indefinitely.
-- **Reservation expiry.** Same idea from the other side: a TTL on reservations
-  with a sweeper, so no failure mode can strand inventory forever.
 - **Retries with backoff** around both third parties, and a circuit breaker so
   a slow gateway sheds load instead of consuming the connection pool.
 - **Tokenise the card.** A real integration collects payment details client
@@ -585,8 +655,9 @@ In rough order of how much they would matter in production:
   an order. Today that is a 409; the alternative is proposing a split, which
   is a pricing and fulfilment decision more than a technical one.
 - **Observability.** Structured logs are in place; what is missing is metrics
-  on reservation failures, payment latency and 409 rates, which are the
-  numbers that tell you inventory is misallocated across the network.
+  on reservation failures, payment latency, 409 rates and the size of the
+  reconciliation backlog, and an alert on the "needs attention" log line,
+  which today nobody is paged for.
 - **Rate limiting and authentication**, per the note above.
 - **Expiring idempotency keys.** They are kept forever today; production wants
   a retention window and a sweep, since their only purpose is to cover a

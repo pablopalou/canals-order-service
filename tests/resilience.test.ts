@@ -38,6 +38,12 @@ class HangingGateway implements PaymentGateway {
       // intentionally never settles
     });
   }
+
+  async findCharge(): Promise<ChargeResult | null> {
+    return await new Promise<ChargeResult | null>(() => {
+      // intentionally never settles
+    });
+  }
 }
 
 after(closeDatabase);
@@ -92,7 +98,8 @@ describe('when the payment gateway stops answering', () => {
   it('does not leave the timer holding the event loop open', async () => {
     const gateway = withTimeout(
       {
-        charge: async () => ({ paymentId: 'pay_fast' }),
+        charge: async () => await Promise.resolve({ paymentId: 'pay_fast' }),
+        findCharge: async () => await Promise.resolve(null),
       },
       60_000,
     );

@@ -15,6 +15,13 @@
       "when": 1789221963754,
       "tag": "0001_widen_order_total",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789310730060,
+      "tag": "0002_reconciliation",
+      "breakpoints": true
     }
   ]
 }

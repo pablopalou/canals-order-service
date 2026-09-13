@@ -31,10 +31,46 @@ export const PAYMENT_INDETERMINATE = 'payment_indeterminate';
 
 export interface PaymentGateway {
   charge(request: ChargeRequest): Promise<ChargeResult>;
+
+  /**
+   * Looks up the charge made under an idempotency key, or null if the gateway
+   * holds none.
+   *
+   * Reconciliation cannot resolve an unknown outcome by charging again: that
+   * needs the card number, which is deliberately never stored. It has to ask
+   * instead. Real processors support this (Stripe retrieves by PaymentIntent,
+   * Adyen by merchant reference).
+   */
+  findCharge(idempotencyKey: string): Promise<ChargeResult | null>;
+}
+
+/** Rejects with an indeterminate payment error if `work` outlasts `timeoutMs`. */
+async function raceTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+
+  const expiry = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new AppError(
+          504,
+          PAYMENT_INDETERMINATE,
+          `The payment gateway did not respond within ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([work, expiry]);
+  } finally {
+    // Without this the timer keeps the event loop alive for its full
+    // duration after a call that answered promptly.
+    clearTimeout(timer);
+  }
 }
 
 /**
- * Bounds a charge in time.
+ * Bounds every gateway call in time.
  *
  * A gateway that never answers is worse than one that refuses: without a
  * bound, the request is held open forever, and so is every resource attached
@@ -47,35 +83,16 @@ export function withTimeout(
   timeoutMs: number,
 ): PaymentGateway {
   return {
-    async charge(request: ChargeRequest): Promise<ChargeResult> {
-      let timer: NodeJS.Timeout | undefined;
-
-      const expiry = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-          reject(
-            new AppError(
-              504,
-              PAYMENT_INDETERMINATE,
-              `The payment gateway did not respond within ${timeoutMs}ms`,
-            ),
-          );
-        }, timeoutMs);
-      });
-
-      try {
-        return await Promise.race([gateway.charge(request), expiry]);
-      } finally {
-        // Without this the timer keeps the event loop alive for its full
-        // duration after a charge that answered promptly.
-        clearTimeout(timer);
-      }
-    },
+    charge: async (request) =>
+      await raceTimeout(gateway.charge(request), timeoutMs),
+    findCharge: async (idempotencyKey) =>
+      await raceTimeout(gateway.findCharge(idempotencyKey), timeoutMs),
   };
 }
 
 export type MockPaymentGatewayOptions = {
   latencyMs?: number;
-  /** Chaos knob: fraction of charges that time out, in [0, 1]. */
+  /** Chaos knob: fraction of charges that are declined, in [0, 1]. */
   failureRate?: number;
   random?: () => number;
 };
@@ -121,6 +138,8 @@ export class MockPaymentGateway implements PaymentGateway {
       );
     }
 
+    // Lost on the way there: the gateway never saw the request, so nothing
+    // was charged, but the caller cannot tell that from silence.
     if (suffix === '0069') {
       throw new AppError(
         504,
@@ -131,6 +150,23 @@ export class MockPaymentGateway implements PaymentGateway {
 
     const paymentId = `pay_${randomUUID()}`;
     this.charges.set(request.idempotencyKey, paymentId);
+
+    // Lost on the way back: the charge went through and only the response
+    // disappeared. From the caller's side this looks identical to 0069, which
+    // is exactly why reconciliation has to ask rather than assume.
+    if (suffix === '0077') {
+      throw new AppError(
+        504,
+        PAYMENT_INDETERMINATE,
+        'The payment gateway did not respond in time',
+      );
+    }
+
     return { paymentId };
+  }
+
+  async findCharge(idempotencyKey: string): Promise<ChargeResult | null> {
+    const paymentId = this.charges.get(idempotencyKey);
+    return await Promise.resolve(paymentId ? { paymentId } : null);
   }
 }

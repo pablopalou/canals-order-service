@@ -72,3 +72,31 @@ export async function findEligibleWarehouses(
     distanceKm: Number(row.distance_km),
   }));
 }
+
+/**
+ * Distance from a destination to one particular warehouse, computed with the
+ * same formula as selection so the two can never disagree. Used to rebuild an
+ * order's response after the fact, when the request that chose the warehouse
+ * is long gone.
+ */
+export async function distanceToWarehouse(
+  executor: Database | Transaction,
+  warehouseId: string,
+  destination: Coordinates,
+): Promise<EligibleWarehouse> {
+  const result = await executor.execute(sql`
+    select w.id as id, w.name as name, ${distanceKm(destination)} as distance_km
+    from warehouses w
+    where w.id = ${warehouseId}::uuid
+  `);
+
+  const row = (result.rows as Array<Record<string, unknown>>)[0];
+  if (!row) throw new Error(`warehouse ${warehouseId} does not exist`);
+
+  return {
+    id: row.id as string,
+    name: row.name as string,
+    distanceKm: Number(row.distance_km),
+  };
+}
+

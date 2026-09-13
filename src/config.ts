@@ -34,7 +34,24 @@ const envSchema = z.object({
   /** Mocked payment gateway behaviour, see src/services/payments.ts */
   PAYMENTS_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
   PAYMENTS_LATENCY_MS: z.coerce.number().int().min(0).default(120),
-});
+
+  /**
+   * Reconciliation of orders whose charge outcome is unknown. An interval of
+   * zero disables the in-process scheduler.
+   */
+  RECONCILE_INTERVAL_MS: z.coerce.number().int().min(0).default(30_000),
+  RECONCILE_AFTER_MS: z.coerce.number().int().positive().default(300_000),
+  RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+}).refine(
+  // Reconciling a charge that may still be on its way to the gateway would be
+  // told no charge exists, cancel the order, and then watch the charge land.
+  // The threshold has to sit well clear of the longest a charge can take.
+  (env) => env.RECONCILE_AFTER_MS >= 2 * env.PAYMENTS_TIMEOUT_MS,
+  {
+    path: ['RECONCILE_AFTER_MS'],
+    message: 'must be at least twice PAYMENTS_TIMEOUT_MS',
+  },
+);
 
 const parsed = envSchema.safeParse(process.env);
 

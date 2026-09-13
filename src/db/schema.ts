@@ -130,6 +130,11 @@ export const orders = pgTable(
     cardLast4: text('card_last4').notNull(),
     paymentId: text('payment_id'),
     paymentFailureReason: text('payment_failure_reason'),
+    // How many times reconciliation has looked at this order without being
+    // able to settle it. Surfaces an order the gateway will not answer about.
+    reconciliationAttempts: integer('reconciliation_attempts')
+      .notNull()
+      .default(0),
 
     createdAt,
     updatedAt: timestamp('updated_at', { withTimezone: true })
@@ -138,6 +143,12 @@ export const orders = pgTable(
   },
   (t) => [
     index('orders_customer_id_created_at_idx').on(t.customerId, t.createdAt),
+    // Reconciliation only ever looks for orders stuck in pending_payment.
+    // A partial index holds just those rows, so it stays tiny however many
+    // settled orders the table accumulates.
+    index('orders_pending_payment_updated_at_idx')
+      .on(t.updatedAt)
+      .where(sql`${t.status} = 'pending_payment'`),
     check('orders_total_positive', sql`${t.totalCents} > 0`),
     check('orders_card_last4_format', sql`${t.cardLast4} ~ '^[0-9]{4}$'`),
     check('orders_currency_format', sql`${t.currency} ~ '^[A-Z]{3}$'`),
@@ -173,14 +184,19 @@ export const orderItems = pgTable(
  * click, so double submits and client retries are expected traffic, and a
  * retry must never place a second order or charge a second time.
  */
-export const idempotencyKeys = pgTable('idempotency_keys', {
-  key: text('key').primaryKey(),
-  // Guards against a client reusing one key for a different payload.
-  requestFingerprint: text('request_fingerprint').notNull(),
-  orderId: uuid('order_id').references(() => orders.id, {
-    onDelete: 'cascade',
-  }),
-  responseStatus: integer('response_status'),
-  responseBody: jsonb('response_body'),
-  createdAt,
-});
+export const idempotencyKeys = pgTable(
+  'idempotency_keys',
+  {
+    key: text('key').primaryKey(),
+    // Guards against a client reusing one key for a different payload.
+    requestFingerprint: text('request_fingerprint').notNull(),
+    orderId: uuid('order_id').references(() => orders.id, {
+      onDelete: 'cascade',
+    }),
+    responseStatus: integer('response_status'),
+    responseBody: jsonb('response_body'),
+    createdAt,
+  },
+  // Reconciliation starts from an order and needs the key it was placed with.
+  (t) => [index('idempotency_keys_order_id_idx').on(t.orderId)],
+);
