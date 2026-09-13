@@ -19,6 +19,16 @@ import {
   PAYMENT_INDETERMINATE,
   type PaymentGateway,
 } from '../services/payments.ts';
+import {
+  failAndReleaseStock,
+  loadOrderLines,
+  markPaid,
+  recordResponse,
+  toOrderResponse,
+  type Order,
+  type OrderLine,
+  type OrderResponse,
+} from './order-settlement.ts';
 import { findEligibleWarehouses } from './warehouse-selection.ts';
 
 const PG_UNIQUE_VIOLATION = '23505';
@@ -31,23 +41,7 @@ export type CreateOrderInput = {
   payment: { cardNumber: string };
 };
 
-export type OrderResponse = {
-  id: string;
-  status: 'pending_payment' | 'paid' | 'payment_failed';
-  customerId: string;
-  warehouse: { id: string; name: string; distanceKm: number };
-  items: Array<{
-    productId: string;
-    sku: string;
-    quantity: number;
-    unitPriceCents: number;
-  }>;
-  totalCents: number;
-  currency: string;
-  paymentId: string | null;
-  cardLast4: string;
-  createdAt: string;
-};
+export type { OrderResponse };
 
 /**
  * The subset of a logger this module needs. Depending on the shape rather
@@ -55,6 +49,8 @@ export type OrderResponse = {
  */
 export type Logger = {
   error(context: Record<string, unknown>, message: string): void;
+  warn(context: Record<string, unknown>, message: string): void;
+  info(context: Record<string, unknown>, message: string): void;
 };
 
 export type OrderDependencies = {
@@ -175,6 +171,14 @@ async function reserveOrder(
           destination,
           warehouseId: candidate.id,
         });
+
+        // Linked now rather than at settlement: if this process dies before
+        // settling, reconciliation starts from the order and needs its key.
+        await tx
+          .update(idempotencyKeys)
+          .set({ orderId: order.id })
+          .where(eq(idempotencyKeys.key, idempotencyKey));
+
         return { order, warehouse: candidate, lines };
       }
 
@@ -436,15 +440,8 @@ async function insertOrder(
   return { order: order!, lines };
 }
 
-type OrderLine = {
-  productId: string;
-  sku: string;
-  quantity: number;
-  unitPriceCents: number;
-};
-
 type ReservedOrder = {
-  order: typeof orders.$inferSelect;
+  order: Order;
   warehouse: { id: string; name: string; distanceKm: number };
   lines: OrderLine[];
 };
@@ -460,9 +457,8 @@ type ReservedOrder = {
  *  - An indeterminate result (timeout, dropped connection) is *not* rolled
  *    back. The charge may have succeeded, and releasing stock while the
  *    customer's card was debited is the one outcome that costs real money and
- *    real trust. The order stays `pending_payment` for reconciliation: a
- *    background worker replays the same idempotency key against the gateway,
- *    which either returns the original charge or confirms none exists.
+ *    real trust. The order stays `pending_payment`, and reconciliation later
+ *    asks the gateway what became of the charge made under this key.
  */
 async function settlePayment(
   deps: OrderDependencies,
@@ -492,15 +488,16 @@ async function settlePayment(
       await deps.db
         .update(orders)
         .set({ paymentFailureReason: error.message, updatedAt: new Date() })
-        .where(eq(orders.id, order.id));
+        .where(
+          and(eq(orders.id, order.id), eq(orders.status, 'pending_payment')),
+        );
       throw error;
     }
 
     // If the compensation itself fails, the payment error is still the truth
     // the caller needs. Letting the secondary failure propagate would report a
     // declined card as an internal error and lose the reason entirely. The
-    // stranded reservation is logged loudly and is the reconciliation
-    // worker's to resolve.
+    // order stays pending_payment, so reconciliation will resolve it.
     try {
       await releaseReservation(deps, idempotencyKey, reserved, error);
     } catch (compensationError) {
@@ -517,23 +514,58 @@ async function settlePayment(
     throw error;
   }
 
-  const response = await deps.db.transaction(async (tx) => {
-    const [settled] = await tx
-      .update(orders)
-      .set({ status: 'paid', paymentId, updatedAt: new Date() })
-      .where(eq(orders.id, order.id))
-      .returning();
+  return await deps.db.transaction(async (tx) => {
+    const settled = await markPaid(tx, order.id, paymentId);
 
-    const body = toOrderResponse(settled!, reserved.warehouse, reserved.lines);
-    await tx
-      .update(idempotencyKeys)
-      .set({ orderId: order.id, responseStatus: 201, responseBody: body })
-      .where(eq(idempotencyKeys.key, idempotencyKey));
+    if (!settled) {
+      // Reconciliation reached this order first. That can only happen when
+      // this request outlived the reconciliation threshold, which config
+      // validation keeps well above the payment timeout — but it is money, so
+      // it is handled rather than assumed away.
+      return await resolveLateSettlement(deps, tx, reserved, paymentId);
+    }
 
+    const body = toOrderResponse(settled, reserved.warehouse, reserved.lines);
+    await recordResponse(tx, idempotencyKey, {
+      orderId: order.id,
+      status: 201,
+      body,
+    });
     return body;
   });
+}
 
-  return response;
+/**
+ * The charge succeeded but the order had already been settled by
+ * reconciliation. If reconciliation also found the charge, the outcome agrees
+ * and the order is simply returned. If it concluded there was no charge and
+ * released the stock, the customer has now paid for a cancelled order: that
+ * needs a refund, and it is logged as such rather than silently swallowed.
+ */
+async function resolveLateSettlement(
+  deps: OrderDependencies,
+  tx: Transaction,
+  reserved: ReservedOrder,
+  paymentId: string,
+): Promise<OrderResponse> {
+  const [current] = await tx
+    .select()
+    .from(orders)
+    .where(eq(orders.id, reserved.order.id));
+
+  if (current?.status === 'paid') {
+    return toOrderResponse(current, reserved.warehouse, reserved.lines);
+  }
+
+  deps.logger.error(
+    { orderId: reserved.order.id, paymentId, status: current?.status },
+    'charge captured for an order reconciliation already cancelled; refund required',
+  );
+  throw new AppError(
+    409,
+    'order_already_resolved',
+    'This order was cancelled before its payment was confirmed',
+  );
 }
 
 /** Compensating transaction for a declined charge. */
@@ -550,47 +582,16 @@ async function releaseReservation(
       : { status: 502, code: 'payment_error', message: 'Payment failed' };
 
   await deps.db.transaction(async (tx) => {
-    const lines = await tx
-      .select({
-        productId: orderItems.productId,
-        quantity: orderItems.quantity,
-      })
-      .from(orderItems)
-      .where(eq(orderItems.orderId, order.id))
-      .orderBy(orderItems.productId);
-
-    await tx.execute(sql`
-      update inventory as i
-      set quantity = i.quantity + v.quantity, updated_at = now()
-      from (values ${sql.join(
-        lines.map(
-          (line) => sql`(${line.productId}::uuid, ${line.quantity}::integer)`,
-        ),
-        sql`, `,
-      )}) as v (product_id, quantity)
-      where i.warehouse_id = ${order.warehouseId}::uuid
-        and i.product_id = v.product_id
-    `);
-
-    await tx
-      .update(orders)
-      .set({
-        status: 'payment_failed',
-        paymentFailureReason: failure.message,
-        updatedAt: new Date(),
-      })
-      .where(eq(orders.id, order.id));
+    const failed = await failAndReleaseStock(tx, order.id, failure.message);
+    if (!failed) return;
 
     // Recording the failure lets a retry of the same key return the same
     // answer instead of attempting a second charge.
-    await tx
-      .update(idempotencyKeys)
-      .set({
-        orderId: order.id,
-        responseStatus: failure.status,
-        responseBody: { code: failure.code, message: failure.message },
-      })
-      .where(eq(idempotencyKeys.key, idempotencyKey));
+    await recordResponse(tx, idempotencyKey, {
+      orderId: order.id,
+      status: failure.status,
+      body: { code: failure.code, message: failure.message },
+    });
   });
 }
 
@@ -624,17 +625,7 @@ export async function findOrder(
   const [order] = await db.select().from(orders).where(eq(orders.id, id));
   if (!order) return null;
 
-  const lines = await db
-    .select({
-      productId: orderItems.productId,
-      sku: products.sku,
-      quantity: orderItems.quantity,
-      unitPriceCents: orderItems.unitPriceCents,
-    })
-    .from(orderItems)
-    .innerJoin(products, eq(products.id, orderItems.productId))
-    .where(eq(orderItems.orderId, order.id))
-    .orderBy(products.sku);
+  const lines = await loadOrderLines(db, order.id);
 
   return {
     id: order.id,
@@ -656,28 +647,5 @@ export async function findOrder(
     paymentId: order.paymentId,
     createdAt: order.createdAt.toISOString(),
     updatedAt: order.updatedAt.toISOString(),
-  };
-}
-
-function toOrderResponse(
-  order: typeof orders.$inferSelect,
-  warehouse: ReservedOrder['warehouse'],
-  lines: OrderLine[],
-): OrderResponse {
-  return {
-    id: order.id,
-    status: order.status,
-    customerId: order.customerId,
-    warehouse: {
-      id: warehouse.id,
-      name: warehouse.name,
-      distanceKm: Math.round(warehouse.distanceKm * 10) / 10,
-    },
-    items: lines,
-    totalCents: order.totalCents,
-    currency: order.currency,
-    paymentId: order.paymentId,
-    cardLast4: order.cardLast4,
-    createdAt: order.createdAt.toISOString(),
   };
 }
