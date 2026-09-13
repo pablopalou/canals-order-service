@@ -12,6 +12,7 @@ import {
   type OrderResponse,
 } from './order-settlement.ts';
 import type { Logger } from './orders.ts';
+import { runPeriodically, type Scheduled } from '../scheduler.ts';
 import { distanceToWarehouse } from './warehouse-selection.ts';
 
 /**
@@ -218,53 +219,25 @@ async function rebuildResponse(
   return toOrderResponse(order, warehouse, lines);
 }
 
-export type Reconciler = {
-  /** Stops scheduling passes and waits for one in flight to finish. */
-  stop(): Promise<void>;
-};
+export type Reconciler = Scheduled;
 
 /**
- * Runs a pass on an interval. Passes never overlap within a process: if one is
- * still going when the next is due, that tick is skipped. Across processes,
- * the claim is what keeps two passes off the same order.
+ * Runs reconciliation on an interval. Across processes, the claim is what
+ * keeps two passes off the same order.
  */
 export function startReconciler(
   deps: ReconciliationDependencies,
   options: ReconciliationOptions & { intervalMs: number },
 ): Reconciler {
-  let inFlight: Promise<void> | null = null;
-  let stopped = false;
-
-  const runPass = async (): Promise<void> => {
-    try {
+  return runPeriodically(
+    'reconciliation',
+    options.intervalMs,
+    async () => {
       const report = await reconcilePendingOrders(deps, options);
       if (report.claimed > 0) {
         deps.logger.info({ ...report }, 'reconciliation pass complete');
       }
-    } catch (error) {
-      // A pass failing (the database is down, say) must not take the process
-      // with it. The next tick tries again.
-      deps.logger.error({ err: error }, 'reconciliation pass failed');
-    }
-  };
-
-  const timer = setInterval(() => {
-    if (stopped || inFlight) return;
-    inFlight = runPass().finally(() => {
-      inFlight = null;
-    });
-  }, options.intervalMs);
-
-  // Reconciliation alone is no reason to keep the process alive.
-  timer.unref();
-
-  return {
-    async stop() {
-      stopped = true;
-      clearInterval(timer);
-      // Let a pass that is mid-settlement finish rather than abandoning it
-      // between the gateway's answer and the database write.
-      if (inFlight) await inFlight;
     },
-  };
+    deps.logger,
+  );
 }

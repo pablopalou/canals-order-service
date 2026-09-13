@@ -30,6 +30,8 @@ services:
       PORT: "3000"
       NODE_ENV: production
       LOG_LEVEL: info
+      # The browser origin of the UI, if it is not served from this origin.
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       PAYMENTS_LATENCY_MS: "120"
       # Overridable from the shell to watch reconciliation in seconds rather
       # than minutes; see "Try it" in the README.

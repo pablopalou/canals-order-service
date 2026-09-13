@@ -15,6 +15,22 @@ const envSchema = z.object({
     .enum(['development', 'test', 'production'])
     .default('development'),
 
+  /**
+   * Browser origins allowed to call the API, comma separated. Empty means the
+   * UI is served from the same origin (behind the same gateway) and no CORS
+   * headers are sent at all, which is the safest default.
+   */
+  CORS_ORIGINS: z
+    .string()
+    .default('')
+    .transform((value) =>
+      value
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean),
+    )
+    .pipe(z.array(z.url({ protocol: /^https?$/ }))),
+
   /** Connection pool and query budgets, tuned per environment. */
   DB_POOL_MAX: z.coerce.number().int().positive().default(10),
   DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
@@ -30,6 +46,8 @@ const envSchema = z.object({
    * exceeds this is treated as indeterminate, never as a failure.
    */
   PAYMENTS_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  /** Geocoding has no side effect, so a short budget and a retryable 503. */
+  GEOCODING_TIMEOUT_MS: z.coerce.number().int().positive().default(3_000),
 
   /** Mocked payment gateway behaviour, see src/services/payments.ts */
   PAYMENTS_FAILURE_RATE: z.coerce.number().min(0).max(1).default(0),
@@ -42,6 +60,19 @@ const envSchema = z.object({
   RECONCILE_INTERVAL_MS: z.coerce.number().int().min(0).default(30_000),
   RECONCILE_AFTER_MS: z.coerce.number().int().positive().default(300_000),
   RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+
+  /** Settled idempotency keys are kept this long, then purged. */
+  IDEMPOTENCY_RETENTION_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(24 * 60 * 60 * 1000),
+  /** How often the purge runs. Zero disables it. */
+  IDEMPOTENCY_PURGE_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .default(60 * 60 * 1000),
 }).refine(
   // Reconciling a charge that may still be on its way to the gateway would be
   // told no charge exists, cancel the order, and then watch the charge land.

@@ -197,6 +197,13 @@ export const idempotencyKeys = pgTable(
     responseBody: jsonb('response_body'),
     createdAt,
   },
-  // Reconciliation starts from an order and needs the key it was placed with.
-  (t) => [index('idempotency_keys_order_id_idx').on(t.orderId)],
+  (t) => [
+    // Reconciliation starts from an order and needs the key it was placed with.
+    index('idempotency_keys_order_id_idx').on(t.orderId),
+    // Retention deletes settled keys by age. Keys still awaiting an outcome
+    // are never candidates, so they are left out of the index entirely.
+    index('idempotency_keys_settled_created_at_idx')
+      .on(t.createdAt)
+      .where(sql`${t.responseStatus} is not null`),
+  ],
 );

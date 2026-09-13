@@ -1,8 +1,13 @@
 import { config } from './config.ts';
 import { db, pool } from './db/client.ts';
 import { buildApp } from './app.ts';
+import { purgeExpiredIdempotencyKeys } from './domain/idempotency-retention.ts';
 import { startReconciler } from './domain/reconciliation.ts';
-import { MockGeocodingProvider } from './services/geocoding.ts';
+import { runPeriodically } from './scheduler.ts';
+import {
+  MockGeocodingProvider,
+  withGeocodingTimeout,
+} from './services/geocoding.ts';
 import { MockPaymentGateway, withTimeout } from './services/payments.ts';
 
 // One gateway client shared by checkout and reconciliation. With the mock this
@@ -17,7 +22,10 @@ const payments = withTimeout(
 
 const app = await buildApp({
   db,
-  geocoding: new MockGeocodingProvider(),
+  geocoding: withGeocodingTimeout(
+    new MockGeocodingProvider(),
+    config.GEOCODING_TIMEOUT_MS,
+  ),
   payments,
 });
 
@@ -32,6 +40,24 @@ const reconciler =
           olderThanMs: config.RECONCILE_AFTER_MS,
           batchSize: config.RECONCILE_BATCH_SIZE,
         },
+      )
+    : null;
+
+const idempotencyPurge =
+  config.IDEMPOTENCY_PURGE_INTERVAL_MS > 0
+    ? runPeriodically(
+        'idempotency-retention',
+        config.IDEMPOTENCY_PURGE_INTERVAL_MS,
+        async () => {
+          const deleted = await purgeExpiredIdempotencyKeys(db, {
+            retentionMs: config.IDEMPOTENCY_RETENTION_MS,
+            batchSize: 1_000,
+          });
+          if (deleted > 0) {
+            app.log.info({ deleted }, 'expired idempotency keys purged');
+          }
+        },
+        app.log,
       )
     : null;
 
@@ -57,8 +83,9 @@ process.on('uncaughtException', (error) => {
 async function shutdown(signal: string): Promise<void> {
   app.log.info({ signal }, 'shutting down');
   try {
-    // Reconciliation first, so no new pass starts while requests drain.
+    // Background tasks first, so nothing new starts while requests drain.
     if (reconciler) await reconciler.stop();
+    if (idempotencyPurge) await idempotencyPurge.stop();
     await app.close();
     await pool.end();
     process.exit(0);

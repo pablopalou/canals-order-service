@@ -1,0 +1,1 @@
+CREATE INDEX "idempotency_keys_settled_created_at_idx" ON "idempotency_keys" USING btree ("created_at") WHERE "idempotency_keys"."response_status" is not null;

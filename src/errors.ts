@@ -63,6 +63,18 @@ export function isTransientDatabaseError(error: unknown): boolean {
 }
 
 /**
+ * Postgres aborted the transaction because it collided with another one: a
+ * deadlock it broke by picking a victim, or a serialization failure. Nothing
+ * was committed, and running the same request again is exactly right. Lock
+ * ordering should make these rare here, which is the point of treating them
+ * correctly rather than as a 500 when they do occur.
+ */
+export function isRetryableTransactionConflict(error: unknown): boolean {
+  const code = postgresErrorCode(error);
+  return code === '40P01' || code === '40001';
+}
+
+/**
  * Walks the cause chain looking for a Postgres error code. Drivers and query
  * builders wrap errors, so the code is rarely on the error actually thrown.
  */

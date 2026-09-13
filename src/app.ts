@@ -1,3 +1,4 @@
+import cors from '@fastify/cors';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { sql } from 'drizzle-orm';
 import { ZodError } from 'zod';
@@ -6,19 +7,19 @@ import type { OrderDependencies } from './domain/orders.ts';
 
 /** Everything the domain needs except the logger, which the app supplies. */
 export type AppDependencies = Omit<OrderDependencies, 'logger'>;
-import { isAppError, isTransientDatabaseError } from './errors.ts';
+import {
+  isAppError,
+  isRetryableTransactionConflict,
+  isTransientDatabaseError,
+} from './errors.ts';
 import { registerOrderRoutes } from './routes/orders.ts';
 
-/** Methods worth reporting in an Allow header when a path exists. */
-const KNOWN_METHODS = [
-  'GET',
-  'POST',
-  'PUT',
-  'PATCH',
-  'DELETE',
-  'HEAD',
-  'OPTIONS',
-] as const;
+/**
+ * Methods worth reporting in an Allow header when a path exists. OPTIONS is
+ * left out on purpose: CORS answers it for every path, so counting it would
+ * turn every unknown path into a 405.
+ */
+const KNOWN_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'] as const;
 
 /** Our own names for the refusals Fastify makes before a handler runs. */
 const FRAMEWORK_ERROR_CODES: Record<number, string> = {
@@ -65,6 +66,23 @@ export async function buildApp(
     // Ties every log line and error response of one request together.
     genReqId: () => crypto.randomUUID(),
   });
+
+  /**
+   * The endpoint is called by a browser UI. From a different origin, the
+   * custom Idempotency-Key header makes every order a preflighted request,
+   * and without these headers the browser refuses to send it at all. Only the
+   * configured origins are allowed; no credentials, since there is no auth.
+   * Location and Retry-After are exposed because the UI needs both.
+   */
+  if (config.CORS_ORIGINS.length > 0) {
+    await app.register(cors, {
+      origin: config.CORS_ORIGINS,
+      methods: ['GET', 'POST'],
+      allowedHeaders: ['content-type', 'idempotency-key'],
+      exposedHeaders: ['location', 'retry-after'],
+      maxAge: 600,
+    });
+  }
 
   /**
    * Responses are JSON and nothing else, so browsers should never be left to
@@ -183,6 +201,21 @@ export async function buildApp(
           error: {
             code: 'database_unavailable',
             message: 'The service is temporarily unable to reach its database',
+          },
+          requestId: request.id,
+        });
+    }
+
+    if (isRetryableTransactionConflict(error)) {
+      request.log.warn({ err: error }, 'transaction conflict, rolled back');
+      return reply
+        .code(503)
+        .header('retry-after', '1')
+        .send({
+          error: {
+            code: 'transaction_conflict',
+            message:
+              'The request collided with a concurrent one and was rolled back. Retry shortly.',
           },
           requestId: request.id,
         });

@@ -16,6 +16,53 @@ export interface GeocodingProvider {
 }
 
 /**
+ * Bounds a third-party geocoding call and translates its failures.
+ *
+ * Geocoding happens before any transaction opens, so a slow provider holds no
+ * locks — but without a bound it still holds the request, and a provider that
+ * stops answering would pile up every checkout until clients gave up. Unlike a
+ * charge, a geocode has no side effect to be uncertain about, so both a
+ * timeout and a provider error are simply "try again": 503, not 500.
+ *
+ * Refusals the provider meant (an address it cannot resolve) are AppErrors
+ * already and pass through untouched.
+ */
+export function withGeocodingTimeout(
+  provider: GeocodingProvider,
+  timeoutMs: number,
+): GeocodingProvider {
+  return {
+    async geocode(address: Address): Promise<Coordinates> {
+      let timer: NodeJS.Timeout | undefined;
+      const expiry = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new AppError(
+              503,
+              'geocoding_unavailable',
+              `The address could not be resolved within ${timeoutMs}ms; retry shortly`,
+            ),
+          );
+        }, timeoutMs);
+      });
+
+      try {
+        return await Promise.race([provider.geocode(address), expiry]);
+      } catch (error) {
+        if (error instanceof AppError) throw error;
+        throw new AppError(
+          503,
+          'geocoding_unavailable',
+          'The address could not be resolved right now; retry shortly',
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
+/**
  * Stand-in for a third-party geocoding API (Google, Mapbox, Smarty).
  *
  * It is deliberately deterministic rather than random: the warehouse chosen

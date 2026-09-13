@@ -18,6 +18,7 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@fastify/cors": "^11.3.0",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.12.3",
     "pg": "^8.23.0",

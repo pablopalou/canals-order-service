@@ -3,7 +3,13 @@ import { after, beforeEach, describe, it } from 'node:test';
 import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { orders } from '../src/db/schema.ts';
+import { buildApp } from '../src/app.ts';
 import {
+  MockGeocodingProvider,
+  withGeocodingTimeout,
+} from '../src/services/geocoding.ts';
+import {
+  MockPaymentGateway,
   withTimeout,
   type ChargeRequest,
   type ChargeResult,
@@ -15,6 +21,7 @@ import {
   CUSTOMER_ID,
   db,
   orderPayload,
+  PHILADELPHIA,
   resetDatabase,
   stockOf,
 } from './helpers.ts';
@@ -115,6 +122,82 @@ describe('when the payment gateway stops answering', () => {
 
     assert.equal(result.paymentId, 'pay_fast');
     assert.ok(Date.now() - started < 1_000);
+  });
+});
+
+describe('when the geocoding provider fails', () => {
+  beforeEach(resetDatabase);
+
+  const appWith = (geocode: MockGeocodingProvider['geocode']) =>
+    buildApp({
+      db,
+      payments: new MockPaymentGateway(),
+      geocoding: withGeocodingTimeout({ geocode }, 200),
+    });
+
+  const place = async (
+    app: FastifyInstance,
+    key: string,
+    address: typeof PHILADELPHIA = PHILADELPHIA,
+  ) =>
+    await app.inject({
+      method: 'POST',
+      url: '/orders',
+      headers: { 'idempotency-key': key },
+      payload: {
+        ...orderPayload({ items: [{ sku: 'BRK-20A', quantity: 1 }] }),
+        shippingAddress: address,
+      },
+    });
+
+  /**
+   * Geocoding is a third-party call exactly like payments, and it was the one
+   * left unbounded: a provider that stopped answering held every checkout.
+   */
+  it('gives up on a provider that never answers, with a retryable 503', async () => {
+    const hanging = await appWith(async () => await new Promise(() => {}));
+    const before = await stockOf('Newark NJ', 'BRK-20A');
+
+    const started = Date.now();
+    const response = await place(hanging, 'geocoder-hangs-key');
+
+    assert.equal(response.statusCode, 503);
+    assert.equal(response.json().error.code, 'geocoding_unavailable');
+    assert.ok(Date.now() - started < 5_000);
+    // Geocoding runs before anything is reserved, so nothing is left behind.
+    assert.equal(await stockOf('Newark NJ', 'BRK-20A'), before);
+  });
+
+  it('reports a provider error as unavailable, not as a server fault', async () => {
+    const broken = await appWith(async () => await Promise.reject(new Error('ECONNRESET')));
+
+    const response = await place(broken, 'geocoder-errors-key');
+
+    assert.equal(response.statusCode, 503);
+    assert.equal(response.json().error.code, 'geocoding_unavailable');
+  });
+
+  /** The key is only claimed inside the reservation, which never started. */
+  it('lets the same key succeed once the provider recovers', async () => {
+    const broken = await appWith(async () => await Promise.reject(new Error('down')));
+    assert.equal((await place(broken, 'geocoder-recovers-key')).statusCode, 503);
+
+    const healthy = await appWith((address) => new MockGeocodingProvider().geocode(address));
+    const retried = await place(healthy, 'geocoder-recovers-key');
+
+    assert.equal(retried.statusCode, 201);
+  });
+
+  it('still passes through an address the provider cannot resolve', async () => {
+    const app = await appWith((address) => new MockGeocodingProvider().geocode(address));
+
+    const response = await place(app, 'geocoder-refuses-key', {
+      ...PHILADELPHIA,
+      country: 'UY',
+    });
+
+    assert.equal(response.statusCode, 422);
+    assert.equal(response.json().error.code, 'address_not_geocodable');
   });
 });
 

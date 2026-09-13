@@ -19,11 +19,17 @@ const ADMIN_URL =
 process.env.DATABASE_URL = TEST_URL;
 process.env.NODE_ENV = 'test';
 process.env.LOG_LEVEL = 'silent';
+// Assigned unconditionally, not with ??=: the suite asserts on these values,
+// so a developer's own environment (a sourced .env, say) must not change what
+// the tests run against. With ??= an empty CORS_ORIGINS in .env silently
+// disabled CORS under test, and one CORS test passed without checking anything.
+//
 // The suite runs requests in parallel against one database and asserts on lock
 // contention; a short lock budget keeps that test fast without changing what
 // it proves.
-process.env.DB_POOL_MAX ??= '20';
-process.env.DB_LOCK_TIMEOUT_MS ??= '400';
+process.env.DB_POOL_MAX = '20';
+process.env.DB_LOCK_TIMEOUT_MS = '400';
+process.env.CORS_ORIGINS = 'https://shop.example.com';
 
 /**
  * Creates the database if needed and migrates it, so `npm test` works from a

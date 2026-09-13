@@ -29,6 +29,13 @@
       "when": 1789312582687,
       "tag": "0003_inventory_fillfactor",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789312836548,
+      "tag": "0004_idempotency_retention",
+      "breakpoints": true
     }
   ]
 }
