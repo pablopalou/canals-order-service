@@ -4,15 +4,15 @@ import { sql } from 'drizzle-orm';
 import { ZodError } from 'zod';
 import { config } from './config.ts';
 import type { OrderDependencies } from './domain/orders.ts';
-
-/** Everything the domain needs except the logger, which the app supplies. */
-export type AppDependencies = Omit<OrderDependencies, 'logger'>;
 import {
   isAppError,
   isRetryableTransactionConflict,
   isTransientDatabaseError,
 } from './errors.ts';
 import { registerOrderRoutes } from './routes/orders.ts';
+
+/** Everything the domain needs except the logger, which the app supplies. */
+export type AppDependencies = Omit<OrderDependencies, 'logger'>;
 
 /**
  * Methods worth reporting in an Allow header when a path exists. OPTIONS is

@@ -22,10 +22,26 @@ export type OrderLine = {
   unitPriceCents: number;
 };
 
+/**
+ * The one representation of an order, returned by POST /orders, by
+ * GET /orders/:id, and by a replayed idempotency key alike. Two shapes for the
+ * same resource would force every client to handle both.
+ *
+ * Deliberately absent: the geocoded coordinates and the gateway's failure
+ * text, which are internal.
+ */
 export type OrderResponse = {
   id: string;
   status: 'pending_payment' | 'paid' | 'payment_failed';
   customerId: string;
+  shippingAddress: {
+    line1: string;
+    line2: string | null;
+    city: string;
+    state: string;
+    postalCode: string;
+    country: string;
+  };
   warehouse: { id: string; name: string; distanceKm: number };
   items: OrderLine[];
   totalCents: number;
@@ -33,6 +49,7 @@ export type OrderResponse = {
   paymentId: string | null;
   cardLast4: string;
   createdAt: string;
+  updatedAt: string;
 };
 
 /** Moves a pending order to `paid`. Null if it was no longer pending. */
@@ -164,16 +181,27 @@ export function toOrderResponse(
     id: order.id,
     status: order.status,
     customerId: order.customerId,
+    shippingAddress: {
+      line1: order.shippingLine1,
+      line2: order.shippingLine2,
+      city: order.shippingCity,
+      state: order.shippingState,
+      postalCode: order.shippingPostalCode,
+      country: order.shippingCountry,
+    },
     warehouse: {
       id: warehouse.id,
       name: warehouse.name,
       distanceKm: Math.round(warehouse.distanceKm * 10) / 10,
     },
-    items: lines,
+    // Stored lines have no inherent order, and the request's order is not
+    // kept; sorting by SKU gives every endpoint the same, stable sequence.
+    items: [...lines].sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0)),
     totalCents: order.totalCents,
     currency: order.currency,
     paymentId: order.paymentId,
     cardLast4: order.cardLast4,
     createdAt: order.createdAt.toISOString(),
+    updatedAt: order.updatedAt.toISOString(),
   };
 }

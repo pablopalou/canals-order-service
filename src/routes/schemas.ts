@@ -49,11 +49,22 @@ const nonEmpty = (max = 200) =>
 
 export const addressSchema = z.object({
   line1: nonEmpty(),
-  line2: nonEmpty().nullish(),
+  // A web form submits an untouched optional field as "". That is an absent
+  // second line, not an invalid one.
+  line2: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? null : value),
+    nonEmpty().nullish(),
+  ),
   city: nonEmpty(100),
   state: nonEmpty(50),
   postalCode: nonEmpty(20),
-  country: nonEmpty(2).toUpperCase(),
+  // ISO 3166-1 alpha-2. Checked here rather than left to the geocoder, which
+  // would otherwise be called with "U" and answer with a misleading 422.
+  country: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{2}$/, 'Must be a two-letter ISO 3166-1 country code'),
 });
 
 export const createOrderSchema = z.object({

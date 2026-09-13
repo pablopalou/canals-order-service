@@ -41,6 +41,38 @@ describe('HTTP semantics', () => {
     orderId = created.json().id;
   });
 
+  /**
+   * One resource, one representation. Creating an order and reading it back
+   * used to return two different shapes, which every client would have had to
+   * handle separately.
+   */
+  it('reads an order back in exactly the shape it was created with', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/orders',
+      headers: { 'idempotency-key': 'http-semantics-same-shape' },
+      payload: {
+        customerId: CUSTOMER_ID,
+        shippingAddress: PHILADELPHIA,
+        // Deliberately not in SKU order, so a difference in line ordering
+        // between the two endpoints cannot hide.
+        items: [
+          { productId: productId('CU-ELB-050'), quantity: 3 },
+          { productId: productId('BRK-20A'), quantity: 1 },
+        ],
+        payment: { cardNumber: GOOD_CARD },
+      },
+    });
+    const read = await app.inject({
+      method: 'GET',
+      url: `/orders/${created.json().id}`,
+    });
+
+    assert.equal(created.statusCode, 201);
+    assert.equal(read.statusCode, 200);
+    assert.deepEqual(read.json(), created.json());
+  });
+
   it('points at the new resource with Location', async () => {
     const response = await app.inject({
       method: 'POST',

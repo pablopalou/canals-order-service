@@ -123,6 +123,29 @@ describe('input validation', () => {
     assert.equal(response.statusCode, 201);
   });
 
+  /** A web form submits an untouched optional field as an empty string. */
+  it('treats an empty second address line as absent', async () => {
+    const response = await post({
+      ...valid(),
+      shippingAddress: { ...PHILADELPHIA, line2: '   ' },
+    });
+
+    assert.equal(response.statusCode, 201);
+    assert.equal(response.json().shippingAddress.line2, null);
+  });
+
+  it('rejects a country that is not a two-letter code before geocoding it', async () => {
+    for (const country of ['U', 'USA', 'U1']) {
+      const response = await post({
+        ...valid(),
+        shippingAddress: { ...PHILADELPHIA, country },
+      });
+
+      assert.equal(response.statusCode, 400, `expected 400 for ${country}`);
+      assert.equal(response.json().error.code, 'validation_failed');
+    }
+  });
+
   it('normalises a lowercase country code', async () => {
     const response = await post({
       ...valid(),

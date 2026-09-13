@@ -20,8 +20,9 @@ docker compose up
 ```
 
 That builds the service, starts Postgres, applies the migrations, seeds the
-catalogue, and serves on <http://localhost:3000>. It takes about ten seconds
-from a clean checkout. Postgres is published on **5433** so it cannot collide
+catalogue, and serves on <http://localhost:3000>. The first run pulls the
+Postgres and Node images and builds the service, which takes a minute or two;
+after that it is up in about ten seconds. Postgres is published on **5433** so it cannot collide
 with an instance you may already be running.
 
 Check it is alive:
@@ -58,7 +59,7 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test           # 105 tests
+npm test           # 109 tests
 npm run lint       # type-aware rules the compiler cannot express
 npm run typecheck
 ```
@@ -122,7 +123,7 @@ read from the catalogue, never accepted from the client.
 | 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable, with `Retry-After` |
 | 503 | `transaction_conflict` | Postgres rolled the transaction back to break a deadlock or serialization conflict. Retryable, with `Retry-After` |
 | 503 | `database_unavailable` | The database is momentarily unreachable. Retryable, with `Retry-After` |
-| 504 | `payment_indeterminate` | Charge outcome unknown. Stock **held**, order left `pending_payment` until [reconciliation](#reconciliation) resolves it |
+| 504 | `payment_indeterminate` | Charge outcome unknown — a timeout, a dropped connection, anything short of an explicit decline. Stock **held**, order left `pending_payment` until [reconciliation](#reconciliation) resolves it |
 
 ### Why there is no hosted demo
 
@@ -130,7 +131,7 @@ A deliberate choice rather than an omission. A public deployment of this
 service would be an unauthenticated `POST /orders` on the internet, taking card
 numbers — the assignment rightly sets auth aside, and that is exactly why it
 should not be exposed. `docker compose up` gives the reviewer the same thing in
-about ten seconds, with the database in reach for inspecting what each request
+a minute or two, with the database in reach for inspecting what each request
 did, and the scenarios below are written to be run against it verbatim.
 
 ### Calling it from a browser
@@ -156,7 +157,9 @@ container's healthcheck uses `/ready`.
 ### `GET /orders/:id`
 
 Not in the assignment, but a write-only checkout cannot be verified, and an order
-left `pending_payment` by an indeterminate charge has to be inspectable.
+left `pending_payment` by an indeterminate charge has to be inspectable. It
+returns exactly the representation `POST /orders` returned — one resource, one
+shape, lines ordered by SKU — and a test asserts the two are identical.
 Responses carry `Cache-Control: no-store`, since an order holds a shipping
 address and part of a card number.
 
@@ -462,8 +465,13 @@ Two failure modes that must never be collapsed into one:
 
 - **Declined** — the gateway answered, and the answer was no. No money moved.
   The order is marked `payment_failed` and the reservation is released.
-- **Indeterminate** (timeout, dropped connection) — the charge may or may not
-  have happened. The reservation is deliberately **not** released and the
+- **Indeterminate** — *everything that is not an explicit decline*: our
+  timeout, a dropped connection, a 5xx, a response we did not expect. The
+  default has to be "we do not know", because only a decline proves no money
+  moved. An earlier version had it the other way round, and a socket hang up
+  from a real HTTP client would have released the stock of an order the
+  customer might have paid for — and reported the gateway's `ECONNRESET` to the
+  client as the database being down. The charge may or may not have happened. The reservation is deliberately **not** released and the
   order stays `pending_payment`. Releasing stock while the customer's card was
   in fact debited is the one outcome that costs real money and real trust.
   Reconciliation later asks the gateway what became of it.
@@ -704,7 +712,7 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-A hundred and five tests across ten files, each covering one thing:
+A hundred and nine tests across ten files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
