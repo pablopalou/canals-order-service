@@ -6,7 +6,7 @@ fill it, charge the card.
 `POST /orders` accepts a customer, a shipping address and a list of products.
 It finds a single warehouse holding every requested line, preferring the one
 closest to the shipping address, reserves the stock, and charges the card
-through a payment provider. Geocoding and payments are mocked, as the brief
+through a payment provider. Geocoding and payments are mocked, as the assignment
 allows; everything behind them is real.
 
 ---
@@ -124,6 +124,15 @@ read from the catalogue, never accepted from the client.
 | 503 | `database_unavailable` | The database is momentarily unreachable. Retryable, with `Retry-After` |
 | 504 | `payment_indeterminate` | Charge outcome unknown. Stock **held**, order left `pending_payment` until [reconciliation](#reconciliation) resolves it |
 
+### Why there is no hosted demo
+
+A deliberate choice rather than an omission. A public deployment of this
+service would be an unauthenticated `POST /orders` on the internet, taking card
+numbers — the assignment rightly sets auth aside, and that is exactly why it
+should not be exposed. `docker compose up` gives the reviewer the same thing in
+about ten seconds, with the database in reach for inspecting what each request
+did, and the scenarios below are written to be run against it verbatim.
+
 ### Calling it from a browser
 
 The endpoint is called by a UI. If that UI is served from the same origin as
@@ -146,7 +155,7 @@ container's healthcheck uses `/ready`.
 
 ### `GET /orders/:id`
 
-Not in the brief, but a write-only checkout cannot be verified, and an order
+Not in the assignment, but a write-only checkout cannot be verified, and an order
 left `pending_payment` by an indeterminate charge has to be inspectable.
 Responses carry `Cache-Control: no-store`, since an order holds a shipping
 address and part of a card number.
@@ -522,7 +531,7 @@ to the next candidate rather than overselling — both behaviours are covered in
 
 ### Security
 
-Nothing here is auth — the brief sets that aside — but the parts that are not
+Nothing here is auth — the assignment sets that aside — but the parts that are not
 auth were still treated as if this were live:
 
 - **The card number never lands anywhere.** It is validated, handed to the
@@ -710,7 +719,7 @@ A hundred and five tests across ten files, each covering one thing:
 | `reconciliation` | A lost response confirmed, a missing charge cancelled, recent orders left alone, an unreachable gateway retried and escalated, overlapping passes settling each order once |
 | `idempotency-retention` | Old settled keys purged, recent and unsettled ones kept, a backlog larger than a batch, and what replaying a purged key means |
 
-The brief says tests are optional and that they trade poorly against reviewer
+The assignment says tests are optional and that they trade poorly against reviewer
 time, which is why none of them assert framework behaviour for its own sake —
 the two that touch 404s and 415s are there because *we* changed those
 responses. The suite exists because "production-ready" was the other
@@ -762,7 +771,7 @@ In rough order of how much they would matter in production:
 
 ## A note on tooling
 
-The brief says AI tools are unrestricted, so for the record: I used an AI
+The assignment says AI tools are unrestricted, so for the record: I used an AI
 assistant while building this, mostly for scaffolding, and reviewed every line
 of the result. The design decisions and their trade-offs are described above
 because I want to discuss them, not because a tool suggested them.

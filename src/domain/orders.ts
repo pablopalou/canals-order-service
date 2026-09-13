@@ -118,6 +118,9 @@ export async function createOrder(
   if (replay) return replay;
 
   // Geocoding is an external call, so it happens before the transaction opens.
+  // Its failures are handled where the provider is wired (server.ts): the
+  // withGeocodingTimeout wrapper bounds the call and turns a timeout or a
+  // provider error into a retryable 503, before anything has been reserved.
   const destination = await deps.geocoding.geocode(input.shippingAddress);
 
   const reserved = await reserveOrder(deps, input, destination, idempotencyKey);
@@ -475,6 +478,8 @@ async function settlePayment(
 
   let paymentId: string;
   try {
+    // Bounded by the withTimeout wrapper applied in server.ts; a timeout
+    // arrives here as payment_indeterminate and is handled below.
     const charge = await deps.payments.charge({
       idempotencyKey,
       cardNumber,
