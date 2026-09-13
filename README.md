@@ -30,6 +30,11 @@ Check it is alive:
 curl localhost:3000/health
 ```
 
+Every setting — pool size, timeouts, reconciliation, retention, CORS — is an
+environment variable listed with its default in `.env.example`, and all of
+them are validated when the process starts, so a bad value fails the boot with
+a message rather than surfacing later.
+
 <details>
 <summary>Running the service outside Docker</summary>
 
@@ -53,7 +58,7 @@ npm run dev
 ```bash
 docker compose up -d postgres
 npm install
-npm test           # 92 tests
+npm test           # 105 tests
 npm run lint       # type-aware rules the compiler cannot express
 npm run typecheck
 ```
@@ -99,22 +104,36 @@ read from the catalogue, never accepted from the client.
 | Status | Code | Meaning |
 | --- | --- | --- |
 | 201 | — | Order placed and paid |
-| 400 | `validation_failed` | Malformed body: bad UUID, non-positive quantity, duplicate line, card failing the Luhn check |
+| 400 | `validation_failed` | Malformed body: bad UUID, non-positive quantity, duplicate line, card failing the Luhn check, control characters |
 | 400 | `idempotency_key_required` / `idempotency_key_invalid` | Header missing, or present but too short |
 | 400 | `invalid_order_id` | The id on `GET /orders/:id` is not a UUID |
 | 402 | `payment_declined` | The issuer said no. Stock released, order marked `payment_failed` |
 | 402 | `payment_not_completed` | Replayed key for an order reconciliation cancelled: the gateway held no charge |
 | 404 | `customer_not_found` / `product_not_found` | Unknown id |
+| 405 | `method_not_allowed` | Path exists under another method; the `Allow` header lists which |
 | 409 | `no_eligible_warehouse` | No single warehouse holds every line in the required quantity |
 | 409 | `request_in_progress` | Same idempotency key, first attempt still running — or its charge outcome is still being reconciled |
-| 422 | `address_not_geocodable` | The address could not be resolved |
-| 422 | `idempotency_key_reused` | Key already used with a different body |
-| 405 | `method_not_allowed` | Path exists under another method; the `Allow` header lists which |
+| 409 | `order_already_resolved` | A charge confirmed for an order reconciliation had already cancelled; logged as needing a refund |
 | 413 | `payload_too_large` | Body over 64 KB |
 | 415 | `unsupported_media_type` | Body is not JSON |
+| 422 | `address_not_geocodable` | The address could not be resolved |
+| 422 | `idempotency_key_reused` | Key already used with a different body |
+| 503 | `geocoding_unavailable` | The geocoding provider failed or did not answer in time. Nothing was reserved; retry with the same key |
 | 503 | `stock_contended` | Waited too long for a row lock; another order holds the same SKU. Retryable, with `Retry-After` |
+| 503 | `transaction_conflict` | Postgres rolled the transaction back to break a deadlock or serialization conflict. Retryable, with `Retry-After` |
 | 503 | `database_unavailable` | The database is momentarily unreachable. Retryable, with `Retry-After` |
 | 504 | `payment_indeterminate` | Charge outcome unknown. Stock **held**, order left `pending_payment` until [reconciliation](#reconciliation) resolves it |
+
+### Calling it from a browser
+
+The endpoint is called by a UI. If that UI is served from the same origin as
+the API (behind the same gateway), nothing is needed and no CORS headers are
+sent. If it lives on another origin, list it in `CORS_ORIGINS`: the custom
+`Idempotency-Key` header makes every order a preflighted request, and without
+CORS the browser refuses to send it at all. `Location` and `Retry-After` are
+exposed to the page. The UI generates one idempotency key per checkout attempt
+— a UUID when the customer presses "place order" — and reuses it for every
+retry of that attempt.
 
 ### `GET /health` and `GET /ready`
 
@@ -280,10 +299,16 @@ Re-seed with `npm run db:seed` to run it again.
 
 ```
 src/
-  routes/     HTTP: validation, status codes, error shape
-  domain/     order placement and warehouse selection
-  services/   third parties behind interfaces (geocoding, payments)
-  db/         schema, migrations, fixtures
+  routes/       HTTP: validation, status codes, error shape
+  domain/
+    orders.ts                 placing an order: reserve, charge, settle
+    order-settlement.ts       the guarded transitions out of pending_payment
+    warehouse-selection.ts    the selection query
+    reconciliation.ts         resolving orders whose charge outcome is unknown
+    idempotency-retention.ts  purging keys past their retry window
+  services/     third parties behind interfaces, with their timeouts
+  db/           schema, client, migrator, fixtures
+  scheduler.ts  background tasks that never overlap and never crash the process
 ```
 
 The domain layer never touches HTTP, and the route layer holds no business
@@ -299,11 +324,46 @@ Iterating warehouses in the application would be an N+1 query, and would also
 be the wrong shape: "has every product" is a property of a set of rows, not of
 any single row. Ties break on warehouse id, so the choice is deterministic.
 
-At a scale of thousands of warehouses this becomes PostGIS with a GiST index
-on a geography column, so nearest-neighbour search uses the index rather than
-scanning every row. Haversine keeps the project runnable with nothing but
-`docker compose up`, and is accurate to well under a percent at these
-distances.
+Haversine keeps the project runnable with nothing but `docker compose up`,
+and is accurate to well under a percent at these distances.
+
+### Warehouse selection at production scale
+
+Every early test ran against five warehouses, where any plan is fast. Loaded
+with 2,000 warehouses and 500 products — a million inventory rows — the
+selection query read the entire inventory table on every checkout with a
+parallel sequential scan, ignoring the `product_id` index that exists for this
+lookup. The plan came from `auto_explain` on the service's own parameterised
+query, not a hand-written approximation.
+
+Joining against a `VALUES` list does not let the planner push the product ids
+down to the index; repeating them as a plain `product_id = any(...)` filter
+does. Under load the difference is not speed but survival — 400 concurrent
+selections against a pool of ten:
+
+| Query | Result |
+| --- | --- |
+| Original | Selections outlast the pool's connection timeout; checkouts **fail** |
+| With the index-friendly filter | ~154 selections/s, all complete |
+| Filter, at most ten candidates returned | ~180 selections/s |
+
+Returning every eligible warehouse cost a sort and a transfer of ~1,900 rows
+per checkout for candidates that are almost never tried, so at most ten are
+returned — ample for the fall-through.
+
+Two decisions came out of measuring rather than assuming:
+
+- **No covering index on `quantity`.** It would halve the read again, but
+  `quantity` is the column every checkout writes, and indexing it rules out
+  in-place (HOT) updates: on a copy of the table, 26% of stock decrements
+  happened in place without it and 0% with it. A faster read is not worth a
+  more expensive write on the hottest row in the system.
+- **`inventory` has a fillfactor of 80.** The same measurement showed HOT
+  updates were impossible at the default of 100, because a packed page has no
+  room for the new row version.
+
+Beyond this scale the next step is PostGIS with a GiST index, so that the
+nearest candidates come from the index instead of a sort.
 
 ### Checkout is split around the payment
 
@@ -351,6 +411,20 @@ own without a restart.
 resolves to `payment_indeterminate`, never to a decline — we stopped waiting,
 which says nothing about whether the money moved, so the reservation is held
 for reconciliation exactly as any other unknown outcome.
+
+**The geocoder never answers.** It is a third-party call exactly like payments,
+and it was the one left unbounded — a provider that stopped answering held
+every checkout open. Geocoding is now bounded at three seconds. Unlike a
+charge it has no side effect to be uncertain about, so a timeout or a provider
+error is a retryable `503 geocoding_unavailable`. It runs before anything is
+reserved, so the same idempotency key simply works once the provider recovers.
+
+**The database dies right after a successful charge.** The worst moment
+available: money has moved and nothing records it. Tested by stopping
+Postgres while a charge was in flight. Settlement fails and the client gets a
+503; retries of its key are told `request_in_progress`; once Postgres returns,
+reconciliation finds the charge and the order becomes `paid`, keeping its
+stock, with a single order in the database.
 
 **A client hangs up mid-charge.** The order completes anyway, and replaying
 the idempotency key hands the caller the finished order rather than starting a
@@ -468,11 +542,14 @@ auth were still treated as if this were live:
 - **The body limit is 64 KB** and orders cap at 200 lines, so a hostile
   payload is rejected before it is parsed.
 - **Everything is bounded**: ten seconds per statement, five waiting for a row
-  lock, thirty for an idle transaction, thirty to deliver a request. Neither a
-  slow client nor a stuck transaction can hold a resource indefinitely.
+  lock, thirty for an idle transaction, thirty to deliver a request, three for
+  geocoding and fifteen for a charge. Neither a slow client, a stuck
+  transaction nor a silent third party can hold a resource indefinitely.
 - **Control characters are rejected at validation.** A NUL byte cannot be
   stored in a Postgres text column, and letting it get that far turns a bad
   request into a 500.
+- **CORS is an allowlist and off by default.** Only origins in
+  `CORS_ORIGINS` are answered, without credentials.
 - **Bodies reaching the prototype chain are refused.** Fastify parses with
   secure-json-parse, and a test asserts it rather than leaving it to luck.
 - **Responses carry `X-Content-Type-Options: nosniff`**, and orders carry
@@ -537,6 +614,15 @@ Because this lives in Postgres rather than in memory, it survives a restart:
 replaying a key after `docker compose restart app` still returns the original
 order.
 
+Keys are not kept forever. One is written per checkout, so left alone the
+table grows without bound on the hottest write path. Settled keys older than
+`IDEMPOTENCY_RETENTION_MS` (24 hours, as Stripe does) are purged hourly in
+bounded batches, through a partial index that holds only settled keys. A key
+whose charge outcome is still unknown is never purged, however old, because
+reconciliation needs it. The trade-off is deliberate: a key replayed after the
+window is a new request — a client retrying a day later is not retrying, it is
+placing an order.
+
 ### Two conventions I considered and did not adopt
 
 **RFC 9457 problem details** (`application/problem+json`) is the standardised
@@ -569,8 +655,17 @@ prefix now would be ceremony; adding it later is a routing change.
 - **The geocoded coordinates are persisted on the order**, so the warehouse
   choice stays auditable if the provider later returns something else.
 - Migrations are reviewed SQL files committed to the repo, applied by a
-  migrator. The schema is never pushed straight from the TypeScript
-  definitions.
+  migrator under an advisory lock. The schema is never pushed straight from the
+  TypeScript definitions.
+
+### Deploying this
+
+`docker compose up` is a demo harness: its command migrates, seeds the demo
+catalogue into an empty database, and starts the service. The runtime image
+itself only starts the service (`node dist/server.js`). In a real deployment
+migrations run as a release step before new instances take traffic, the seed
+never runs, `CORS_ORIGINS` names the real UI, and the database credentials
+come from a secret store rather than the compose file.
 
 ### Mocks
 
@@ -600,7 +695,7 @@ lockfile ([npm/cli#4828](https://github.com/npm/cli/issues/4828)). It worked
 on my machine and nowhere else. Node runs TypeScript and tests on its own, so
 the dependency was removed rather than worked around, and `tsx` went with it.
 
-Ninety-two tests across eight files, each covering one thing:
+A hundred and five tests across ten files, each covering one thing:
 
 | File | What it holds |
 | --- | --- |
@@ -610,16 +705,17 @@ Ninety-two tests across eight files, each covering one thing:
 | `validation` | The input boundary: every malformed request a client will send by accident |
 | `edge-cases` | What the gateway is actually handed, distance ties, stock boundaries, replays in awkward states |
 | `money` | An order total past the 32-bit ceiling |
-| `http-semantics` | Location, 405 with Allow, cache and sniffing headers, prototype-chain payloads |
-| `resilience` | A gateway that never answers, and the liveness/readiness split |
+| `http-semantics` | Location, 405 with Allow, cache and sniffing headers, prototype-chain payloads, CORS, how database failures map to retryable 503s |
+| `resilience` | A gateway or geocoder that never answers or errors, and the liveness/readiness split |
 | `reconciliation` | A lost response confirmed, a missing charge cancelled, recent orders left alone, an unreachable gateway retried and escalated, overlapping passes settling each order once |
+| `idempotency-retention` | Old settled keys purged, recent and unsettled ones kept, a backlog larger than a batch, and what replaying a purged key means |
 
 The brief says tests are optional and that they trade poorly against reviewer
 time, which is why none of them assert framework behaviour for its own sake —
 the two that touch 404s and 415s are there because *we* changed those
 responses. The suite exists because "production-ready" was the other
-instruction, and two of these found real bugs, described in the commits that
-fixed them.
+instruction, and several of these found real bugs, described in the commits
+that fixed them.
 
 The one worth reading is `conserves every unit of stock under mixed concurrent
 load`: twenty simultaneous orders over overlapping products, a third of them
@@ -633,7 +729,8 @@ quantity breaks that equality. The reconciliation tests were also checked
 against deliberately broken code — the pending guard removed, the claim
 stripped of `skip locked` and its lease, a missing charge treated as paid —
 and each mutation is caught. The suite was run five times in a row to
-confirm nothing in it is timing-dependent, and it runs against the service's
+confirm nothing in it is timing-dependent, both with a developer's `.env`
+loaded and with an empty environment as CI has, and it runs against the service's
 own connection pool rather than one built for tests — a pool with different
 timeouts would be exercising something the service never runs. Pool size and
 the statement and lock budgets are configuration, so the suite can shorten the
@@ -659,9 +756,9 @@ In rough order of how much they would matter in production:
   reconciliation backlog, and an alert on the "needs attention" log line,
   which today nobody is paged for.
 - **Rate limiting and authentication**, per the note above.
-- **Expiring idempotency keys.** They are kept forever today; production wants
-  a retention window and a sweep, since their only purpose is to cover a
-  client's retry window.
+- **Cache geocoding results.** Every order geocodes its address, and most
+  customers ship to the same few addresses; a cache keyed on the normalised
+  address would cut provider cost and a failure mode.
 
 ## A note on tooling
 
