@@ -194,6 +194,26 @@ describe('POST /orders', () => {
      * The charge may have succeeded, so the reservation is deliberately NOT
      * released and the order is left for reconciliation.
      */
+    it('holds the reservation when the charge outcome is unknown', async () => {
+      const before = await stockOf('Newark NJ', 'WIRE-12-500');
+
+      const response = await post(
+        orderPayload({
+          items: [{ sku: 'WIRE-12-500', quantity: 3 }],
+          cardNumber: TIMEOUT_CARD,
+        }),
+      );
+
+      assert.equal(response.statusCode, 504);
+      assert.equal(response.json().error.code, 'payment_indeterminate');
+      assert.equal(await stockOf('Newark NJ', 'WIRE-12-500'), before - 3);
+
+      const order = await latestOrder();
+      assert.ok(order, 'the pending order should still exist');
+      assert.equal(order.status, 'pending_payment');
+      assert.ok(order.paymentFailureReason);
+    });
+
     /**
      * What a real HTTP client throws when the connection drops mid-charge: a
      * plain Error, not one of ours. It used to be treated as a decline — stock
@@ -226,26 +246,6 @@ describe('POST /orders', () => {
       const replay = await post(payload, key);
       assert.equal(replay.statusCode, 409);
       assert.equal(replay.json().error.code, 'request_in_progress');
-    });
-
-    it('holds the reservation when the charge outcome is unknown', async () => {
-      const before = await stockOf('Newark NJ', 'WIRE-12-500');
-
-      const response = await post(
-        orderPayload({
-          items: [{ sku: 'WIRE-12-500', quantity: 3 }],
-          cardNumber: TIMEOUT_CARD,
-        }),
-      );
-
-      assert.equal(response.statusCode, 504);
-      assert.equal(response.json().error.code, 'payment_indeterminate');
-      assert.equal(await stockOf('Newark NJ', 'WIRE-12-500'), before - 3);
-
-      const order = await latestOrder();
-      assert.ok(order, 'the pending order should still exist');
-      assert.equal(order.status, 'pending_payment');
-      assert.ok(order.paymentFailureReason);
     });
   });
 

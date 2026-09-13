@@ -22,8 +22,8 @@ docker compose up
 That builds the service, starts Postgres, applies the migrations, seeds the
 catalogue, and serves on <http://localhost:3000>. The first run pulls the
 Postgres and Node images and builds the service, which takes a minute or two;
-after that it is up in about ten seconds. Postgres is published on **5433** so it cannot collide
-with an instance you may already be running.
+after that it is up in about ten seconds. Postgres is published on **5433** so
+it cannot collide with an instance you may already be running.
 
 Check it is alive:
 
@@ -156,10 +156,10 @@ container's healthcheck uses `/ready`.
 
 ### `GET /orders/:id`
 
-Not in the assignment, but a write-only checkout cannot be verified, and an order
-left `pending_payment` by an indeterminate charge has to be inspectable. It
-returns exactly the representation `POST /orders` returned — one resource, one
-shape, lines ordered by SKU — and a test asserts the two are identical.
+Not in the assignment, but a write-only checkout cannot be verified, and an
+order left `pending_payment` by an indeterminate charge has to be inspectable.
+It returns exactly the representation `POST /orders` returned — one resource,
+one shape, lines ordered by SKU — and a test asserts the two are identical.
 Responses carry `Cache-Control: no-store`, since an order holds a shipping
 address and part of a card number.
 
@@ -405,19 +405,18 @@ no recorded response. On restart, a client retrying that key is told
 killing the process with SIGKILL during a charge, restarting, and retrying —
 and reconciliation later settles the order either way.
 
-**Postgres goes away, including mid-transaction.** An idle connection failing raises an `error` event on
-the pool, and a pool with no error listener takes the process down with it —
-which would mean every database restart, failover or maintenance window kills
-every instance. A pool also only speaks for its *idle* clients: one checked
-out for a transaction emits its failure on itself, so a hard kill in the
-middle of one was a second way to the same crash. Every connection now carries
-an error listener, and the pool discards the broken client and opens a fresh
-one on the next query. Killing Postgres outright while a transaction was
-blocked on a row lock leaves the caller with a 503, the process alive, and
-nothing committed. During the outage `/ready`
-reports 503 and requests get `503 database_unavailable` with a `Retry-After`
-rather than a 500, and when Postgres comes back the service recovers on its
-own without a restart.
+**Postgres goes away, including mid-transaction.** An idle connection failing
+raises an `error` event on the pool, and a pool with no error listener takes the
+process down with it — which would mean every database restart, failover or
+maintenance window kills every instance. A pool also only speaks for its *idle*
+clients: one checked out for a transaction emits its failure on itself, so a
+hard kill in the middle of one was a second way to the same crash. Every
+connection now carries an error listener, and the pool discards the broken
+client and opens a fresh one on the next query. Killing Postgres outright while
+a transaction was blocked on a row lock leaves the caller with a 503, the
+process alive, and nothing committed. During the outage `/ready` reports 503 and
+requests get `503 database_unavailable` with a `Retry-After` rather than a 500,
+and when Postgres comes back the service recovers on its own without a restart.
 
 **The gateway never answers.** Charges are bounded in time. The timeout
 resolves to `payment_indeterminate`, never to a decline — we stopped waiting,
@@ -465,16 +464,17 @@ Two failure modes that must never be collapsed into one:
 
 - **Declined** — the gateway answered, and the answer was no. No money moved.
   The order is marked `payment_failed` and the reservation is released.
-- **Indeterminate** — *everything that is not an explicit decline*: our
-  timeout, a dropped connection, a 5xx, a response we did not expect. The
-  default has to be "we do not know", because only a decline proves no money
-  moved. An earlier version had it the other way round, and a socket hang up
-  from a real HTTP client would have released the stock of an order the
-  customer might have paid for — and reported the gateway's `ECONNRESET` to the
-  client as the database being down. The charge may or may not have happened. The reservation is deliberately **not** released and the
-  order stays `pending_payment`. Releasing stock while the customer's card was
-  in fact debited is the one outcome that costs real money and real trust.
-  Reconciliation later asks the gateway what became of it.
+- **Indeterminate** — *everything that is not an explicit decline*: our timeout,
+  a dropped connection, a 5xx, a response we did not expect. The default has to
+  be "we do not know", because only a decline proves no money moved. An earlier
+  version had it the other way round, and a socket hang up from a real HTTP
+  client would have released the stock of an order the customer might have paid
+  for — and reported the gateway's `ECONNRESET` to the client as the database
+  being down. The charge may or may not have happened. The reservation is
+  deliberately **not** released and the order stays `pending_payment`. Releasing
+  stock while the customer's card was in fact debited is the one outcome that
+  costs real money and real trust. Reconciliation later asks the gateway what
+  became of it.
 
 ### Reconciliation
 
@@ -539,18 +539,18 @@ to the next candidate rather than overselling — both behaviours are covered in
 
 ### Security
 
-Nothing here is auth — the assignment sets that aside — but the parts that are not
-auth were still treated as if this were live:
+Nothing here is auth — the assignment sets that aside — but the parts that are
+not auth were still treated as if this were live:
 
 - **The card number never lands anywhere.** It is validated, handed to the
   gateway, and discarded. The database keeps four digits; the logger redacts
   the field on every path, so a future log line cannot leak one by accident.
 - **Prices are server-side.** There is no price field in the request for a
   client to tamper with.
-- **The read endpoint lists its columns explicitly** rather than returning the
-  row. A handler that publishes whatever the table happens to hold will
-  publish the next column somebody adds, and the geocoded coordinates are
-  ours, not the customer's business.
+- **An order is exposed field by field, never as a row.** The representation
+  both endpoints return is built explicitly in `toOrderResponse`, so a column
+  added to the table later is not published by accident, and the geocoded
+  coordinates and the gateway's failure text stay internal.
 - **Errors say what the client did wrong and nothing else.** Unrecognised
   failures are logged in full and returned as an opaque 500 with a request id
   to correlate against.
@@ -727,12 +727,12 @@ A hundred and nine tests across ten files, each covering one thing:
 | `reconciliation` | A lost response confirmed, a missing charge cancelled, recent orders left alone, an unreachable gateway retried and escalated, overlapping passes settling each order once |
 | `idempotency-retention` | Old settled keys purged, recent and unsettled ones kept, a backlog larger than a batch, and what replaying a purged key means |
 
-The assignment says tests are optional and that they trade poorly against reviewer
-time, which is why none of them assert framework behaviour for its own sake —
-the two that touch 404s and 415s are there because *we* changed those
+The assignment says tests are optional and that they trade poorly against
+reviewer time, which is why none of them assert framework behaviour for its own
+sake — the two that touch 404s and 415s are there because *we* changed those
 responses. The suite exists because "production-ready" was the other
-instruction, and several of these found real bugs, described in the commits
-that fixed them.
+instruction, and several of these found real bugs, described in the commits that
+fixed them.
 
 The one worth reading is `conserves every unit of stock under mixed concurrent
 load`: twenty simultaneous orders over overlapping products, a third of them
@@ -743,15 +743,15 @@ afterwards every unit is accounted for —
 
 Any lost update, double decrement, or compensation that released the wrong
 quantity breaks that equality. The reconciliation tests were also checked
-against deliberately broken code — the pending guard removed, the claim
-stripped of `skip locked` and its lease, a missing charge treated as paid —
-and each mutation is caught. The suite was run five times in a row to
-confirm nothing in it is timing-dependent, both with a developer's `.env`
-loaded and with an empty environment as CI has, and it runs against the service's
-own connection pool rather than one built for tests — a pool with different
-timeouts would be exercising something the service never runs. Pool size and
-the statement and lock budgets are configuration, so the suite can shorten the
-lock budget without changing what the contention test proves.
+against deliberately broken code — the pending guard removed, the claim stripped
+of `skip locked` and its lease, a missing charge treated as paid — and each
+mutation is caught. The suite was run five times in a row to confirm nothing in
+it is timing-dependent, both with a developer's `.env` loaded and with an empty
+environment as CI has, and it runs against the service's own connection pool
+rather than one built for tests — a pool with different timeouts would be
+exercising something the service never runs. Pool size and the statement and
+lock budgets are configuration, so the suite can shorten the lock budget without
+changing what the contention test proves.
 
 ---
 

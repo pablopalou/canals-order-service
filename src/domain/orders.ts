@@ -461,11 +461,12 @@ type ReservedOrder = {
  *  - A decline is a definitive "no". The order is marked failed and the
  *    reserved stock is released, because nobody was charged and holding the
  *    units would starve other customers.
- *  - Everything else is indeterminate and is *not* rolled back: our timeout,
- *    a dropped connection, a response we did not expect. The charge may have succeeded, and releasing stock while the
- *    customer's card was debited is the one outcome that costs real money and
- *    real trust. The order stays `pending_payment`, and reconciliation later
- *    asks the gateway what became of the charge made under this key.
+ *  - Everything else is indeterminate and is *not* rolled back: our timeout, a
+ *    dropped connection, a response we did not expect. The charge may have
+ *    succeeded, and releasing stock while the customer's card was debited is
+ *    the one outcome that costs real money and real trust. The order stays
+ *    `pending_payment`, and reconciliation later asks the gateway what became
+ *    of the charge made under this key.
  */
 async function settlePayment(
   deps: OrderDependencies,
@@ -606,6 +607,10 @@ async function leavePendingForReconciliation(
     'charge outcome unknown; order left pending for reconciliation',
   );
 
+  // The column stores our own wording, never the third party's error text: a
+  // payment client's error can echo the request it failed on, card number
+  // included, and this column lives as long as the order. The underlying cause
+  // is in the warn line above, for whoever investigates.
   await deps.db
     .update(orders)
     .set({ paymentFailureReason: indeterminate.message, updatedAt: new Date() })
