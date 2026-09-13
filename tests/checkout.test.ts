@@ -194,6 +194,40 @@ describe('POST /orders', () => {
      * The charge may have succeeded, so the reservation is deliberately NOT
      * released and the order is left for reconciliation.
      */
+    /**
+     * What a real HTTP client throws when the connection drops mid-charge: a
+     * plain Error, not one of ours. It used to be treated as a decline — stock
+     * released, order failed, and ECONNRESET reported to the client as the
+     * database being down. Only an explicit decline proves no money moved.
+     */
+    it('treats an unrecognised gateway failure as unknown, not as a decline', async () => {
+      app = await buildTestApp({
+        charge: async () =>
+          await Promise.reject(
+            Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+          ),
+        findCharge: async () => await Promise.resolve(null),
+      });
+      const before = await stockOf('Newark NJ', 'BRK-20A');
+      const key = nextKey();
+      const payload = orderPayload({ items: [{ sku: 'BRK-20A', quantity: 2 }] });
+
+      const response = await post(payload, key);
+
+      assert.equal(response.statusCode, 504);
+      assert.equal(response.json().error.code, 'payment_indeterminate');
+      assert.equal(await stockOf('Newark NJ', 'BRK-20A'), before - 2);
+
+      const order = await latestOrder();
+      assert.ok(order);
+      assert.equal(order.status, 'pending_payment');
+
+      // A retry must not look like a failure it can act on, or charge again.
+      const replay = await post(payload, key);
+      assert.equal(replay.statusCode, 409);
+      assert.equal(replay.json().error.code, 'request_in_progress');
+    });
+
     it('holds the reservation when the charge outcome is unknown', async () => {
       const before = await stockOf('Newark NJ', 'WIRE-12-500');
 

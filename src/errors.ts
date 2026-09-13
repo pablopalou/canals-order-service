@@ -28,6 +28,12 @@ export const isAppError = (e: unknown): e is AppError => e instanceof AppError;
  * Postgres classes 08 (connection exception) and 57P01 (admin shutdown), plus
  * the driver's own connection failures. All of them mean the database is
  * momentarily unreachable rather than that the request was wrong.
+ *
+ * The socket codes (ECONNRESET and friends) are not specific to Postgres. They
+ * are safe to read as "database" only because every third-party call —
+ * payments, geocoding — translates its own failures into an AppError before
+ * anything reaches the error handler. A gateway error that escaped that
+ * translation was once reported here as the database being down.
  */
 const TRANSIENT_CONNECTION_CODES = new Set([
   '08000', // connection_exception

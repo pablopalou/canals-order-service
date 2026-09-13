@@ -16,6 +16,7 @@ import type {
   GeocodingProvider,
 } from '../services/geocoding.ts';
 import {
+  PAYMENT_DECLINED,
   PAYMENT_INDETERMINATE,
   type PaymentGateway,
 } from '../services/payments.ts';
@@ -29,7 +30,10 @@ import {
   type OrderLine,
   type OrderResponse,
 } from './order-settlement.ts';
-import { findEligibleWarehouses } from './warehouse-selection.ts';
+import {
+  distanceToWarehouse,
+  findEligibleWarehouses,
+} from './warehouse-selection.ts';
 
 const PG_UNIQUE_VIOLATION = '23505';
 const PG_LOCK_NOT_AVAILABLE = '55P03';
@@ -457,8 +461,8 @@ type ReservedOrder = {
  *  - A decline is a definitive "no". The order is marked failed and the
  *    reserved stock is released, because nobody was charged and holding the
  *    units would starve other customers.
- *  - An indeterminate result (timeout, dropped connection) is *not* rolled
- *    back. The charge may have succeeded, and releasing stock while the
+ *  - Everything else is indeterminate and is *not* rolled back: our timeout,
+ *    a dropped connection, a response we did not expect. The charge may have succeeded, and releasing stock while the
  *    customer's card was debited is the one outcome that costs real money and
  *    real trust. The order stays `pending_payment`, and reconciliation later
  *    asks the gateway what became of the charge made under this key.
@@ -489,14 +493,13 @@ async function settlePayment(
     });
     paymentId = charge.paymentId;
   } catch (error) {
-    if (error instanceof AppError && error.code === PAYMENT_INDETERMINATE) {
-      await deps.db
-        .update(orders)
-        .set({ paymentFailureReason: error.message, updatedAt: new Date() })
-        .where(
-          and(eq(orders.id, order.id), eq(orders.status, 'pending_payment')),
-        );
-      throw error;
+    // The default has to be "we do not know". Only an explicit decline from
+    // the gateway proves that no money moved; anything else — a socket hang
+    // up from a real HTTP client, a 5xx, a malformed response — is exactly as
+    // uncertain as a timeout. Treating unrecognised errors as declines would
+    // release the stock of an order the customer may already have paid for.
+    if (!(error instanceof AppError && error.code === PAYMENT_DECLINED)) {
+      throw await leavePendingForReconciliation(deps, order, error);
     }
 
     // If the compensation itself fails, the payment error is still the truth
@@ -511,7 +514,7 @@ async function settlePayment(
           err: compensationError,
           orderId: order.id,
           warehouseId: order.warehouseId,
-          originalError: error instanceof Error ? error.message : String(error),
+          originalError: error.message,
         },
         'failed to release reservation after a failed charge; stock is stranded',
       );
@@ -573,18 +576,57 @@ async function resolveLateSettlement(
   );
 }
 
+/**
+ * The charge's outcome is unknown. The order and its stock stay exactly as
+ * they are, the key gets no recorded response (so a retry is told the request
+ * is in progress rather than charging again), and reconciliation later asks
+ * the gateway what happened.
+ *
+ * Whatever the gateway client threw is translated here into the one error the
+ * caller should see. Left as-is, a connection error from the gateway carrying
+ * ECONNRESET was reported to the client as the *database* being unavailable.
+ */
+async function leavePendingForReconciliation(
+  deps: OrderDependencies,
+  order: Order,
+  cause: unknown,
+): Promise<AppError> {
+  const indeterminate =
+    cause instanceof AppError && cause.code === PAYMENT_INDETERMINATE
+      ? cause
+      : new AppError(
+          504,
+          PAYMENT_INDETERMINATE,
+          'The payment outcome could not be confirmed; the order will be reconciled',
+        );
+
+  // Money in an unknown state is worth more than an info line.
+  deps.logger.warn(
+    { err: cause, orderId: order.id, totalCents: order.totalCents },
+    'charge outcome unknown; order left pending for reconciliation',
+  );
+
+  await deps.db
+    .update(orders)
+    .set({ paymentFailureReason: indeterminate.message, updatedAt: new Date() })
+    .where(and(eq(orders.id, order.id), eq(orders.status, 'pending_payment')));
+
+  return indeterminate;
+}
+
 /** Compensating transaction for a declined charge. */
 async function releaseReservation(
   deps: OrderDependencies,
   idempotencyKey: string,
   reserved: ReservedOrder,
-  error: unknown,
+  decline: AppError,
 ): Promise<void> {
   const { order } = reserved;
-  const failure =
-    error instanceof AppError
-      ? { status: error.status, code: error.code, message: error.message }
-      : { status: 502, code: 'payment_error', message: 'Payment failed' };
+  const failure = {
+    status: decline.status,
+    code: decline.code,
+    message: decline.message,
+  };
 
   await deps.db.transaction(async (tx) => {
     const failed = await failAndReleaseStock(tx, order.id, failure.message);
@@ -600,57 +642,22 @@ async function releaseReservation(
   });
 }
 
-export type OrderView = {
-  id: string;
-  status: OrderResponse['status'];
-  customerId: string;
-  warehouseId: string;
-  shippingAddress: Address;
-  items: Array<{ productId: string; sku: string; quantity: number; unitPriceCents: number }>;
-  totalCents: number;
-  currency: string;
-  cardLast4: string;
-  paymentId: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
 /**
- * Reads an order back.
- *
- * The columns are listed explicitly rather than returning the row: a table
- * grows columns over time, and a handler that spreads whatever the database
- * happens to hold will publish the next one by accident. The geocoded
- * coordinates and the gateway's failure text stay internal.
+ * Reads an order back, in the same representation POST /orders returns. The
+ * distance is recomputed from the coordinates persisted on the order with the
+ * same formula selection used, so both endpoints agree.
  */
 export async function findOrder(
   db: Database,
   id: string,
-): Promise<OrderView | null> {
+): Promise<OrderResponse | null> {
   const [order] = await db.select().from(orders).where(eq(orders.id, id));
   if (!order) return null;
 
+  const warehouse = await distanceToWarehouse(db, order.warehouseId, {
+    latitude: order.shippingLatitude,
+    longitude: order.shippingLongitude,
+  });
   const lines = await loadOrderLines(db, order.id);
-
-  return {
-    id: order.id,
-    status: order.status,
-    customerId: order.customerId,
-    warehouseId: order.warehouseId,
-    shippingAddress: {
-      line1: order.shippingLine1,
-      line2: order.shippingLine2,
-      city: order.shippingCity,
-      state: order.shippingState,
-      postalCode: order.shippingPostalCode,
-      country: order.shippingCountry,
-    },
-    items: lines,
-    totalCents: order.totalCents,
-    currency: order.currency,
-    cardLast4: order.cardLast4,
-    paymentId: order.paymentId,
-    createdAt: order.createdAt.toISOString(),
-    updatedAt: order.updatedAt.toISOString(),
-  };
+  return toOrderResponse(order, warehouse, lines);
 }
